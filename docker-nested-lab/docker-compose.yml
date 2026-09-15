@@ -1,0 +1,82 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Docker-in-Docker nested lab — top-level orchestration
+#
+#  One service (`outer`) is all we need: it is the privileged sandbox that runs
+#  its own dockerd and, from inside it, builds + runs + exposes the inner web
+#  container. Compose here does four things for us:
+#     1. builds the OUTER image from the repo root (so the inner app source is
+#        part of the build context),
+#     2. runs the outer container PRIVILEGED (required for a nested daemon),
+#     3. publishes 8080 so Windows can reach the relay inside the outer container,
+#     4. mounts a NAMED VOLUME over the inner daemon's /var/lib/docker so inner
+#        images survive `docker compose down` + `up`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  outer:
+    build:
+      # Build context is the REPO ROOT so the outer Dockerfile can COPY both
+      # its own files and the inner application source (inner/).
+      context: .
+      dockerfile: outer/Dockerfile
+
+    image: nested-lab-outer:1.0
+    container_name: nested-outer
+
+    # ── Privileged ─────────────────────────────────────────────────────────
+    # A Docker daemon inside a container needs to create namespaces, cgroups,
+    # mounts (overlayfs), iptables rules, and veth pairs — none of which the
+    # default capability set allows. --privileged grants it.
+    privileged: true
+
+    # Give the nested engine a sane default DNS even on restrictive networks.
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
+    # Publish ports to the Windows host.
+    #   8080        -> outer socat relay -> inner web app :80     (the flagship page)
+    #   2376        -> outer :2375       -> INNER Docker Engine API (drive inner docker)
+    #   9000-9010   -> outer :9000-9010  -> DNAT to inner-web     (USER-APP range, 1:1)
+    # Run an app on inner-web port P (9000-9010) and open Chrome at localhost:P.
+    ports:
+      - "8080:8080"            # main page
+      - "2376:2375"            # INNER dockerd API -> `docker -H tcp://localhost:2376`
+      - "9000-9010:9000-9010"  # user-app range, IDENTITY mapping (inner P -> Chrome P)
+
+    # Persistence for the INNER engine: named volume over the inner
+    # /var/lib/docker. Images/layers/volumes survive container recreation.
+    volumes:
+      - inner-docker-data:/var/lib/docker
+
+    environment:
+      # Storage driver for the INNER engine. overlay2 works on Docker Desktop's
+      # WSL2 kernel; override to vfs only if overlayfs nesting misbehaves.
+      STORAGE_DRIVER: overlay2
+
+    # Healthcheck = "the whole nested chain is up", verified by asking the
+    # OUTER container to curl the INNER app via the relay. This is a true
+    # end-to-end signal, not just "the process is alive".
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://localhost:8080/health >/dev/null && curl -fsS http://localhost:2375/version >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s   # inner daemon + build + run takes time on first boot
+
+    # Resource guardrails so the nested engine can't starve the laptop/VM.
+    # (Tune down if your Docker Desktop VM is small.)
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 4G
+
+    restart: unless-stopped
+
+    # Tini-free: our entrypoint is PID 1 and supervises children itself.
+    init: false
+
+volumes:
+  inner-docker-data:
+    name: nested-inner-docker-data

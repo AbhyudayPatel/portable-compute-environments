@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nested Docker Lab</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="card">
+    <h1>🐳 Nested Docker Lab</h1>
+    <p class="subtitle">A request just travelled through <strong>three</strong> layers of containerization to reach this page.</p>
+
+    <ol class="stack">
+      <li class="layer host">
+        <span class="label">Windows Host</span>
+        <span class="detail">browser → http://localhost:8080</span>
+      </li>
+      <li class="arrow">↓<small>Docker Desktop port-forward + WSL2 VM</small></li>
+
+      <li class="layer outer">
+        <span class="label">Outer Linux Container</span>
+        <span class="detail">socat relay  :8080 → inner bridge</span>
+      </li>
+      <li class="arrow">↓<small>inner dockerd + inner bridge</small></li>
+
+      <li class="layer engine">
+        <span class="label">Inner Docker Engine</span>
+        <span class="detail">separate /var/lib/docker, docker0 bridge</span>
+      </li>
+      <li class="arrow">↓<small>inner network namespace</small></li>
+
+      <li class="layer inner">
+        <span class="label">Inner Container</span>
+        <span class="detail">busybox httpd :80</span>
+      </li>
+    </ol>
+
+    <div class="status">
+      <span class="dot"></span>
+      Status: <strong>Running</strong>
+    </div>
+
+    <p class="hint">Try <a href="/health"><code>GET /health</code></a></p>
+  </main>
+</body>
+</html>
