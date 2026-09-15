@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sandbox-scheduler console</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div>
+    <h1># sandbox-scheduler <span class="sub">console</span></h1>
+    <div class="crumb">submit jobs - watch them queue, age, get admitted, run, finish</div>
+  </div>
+  <div class="platform">
+    <span class="pill" id="pill-sched">scheduler ...</span>
+    <span class="pill" id="pill-upstream">upstream ...</span>
+    <span class="pill" id="pill-queue">queue ...</span>
+  </div>
+</header>
+
+<details class="how" open>
+  <summary>How scheduling works here - read this first</summary>
+  <div class="layers">
+    <div class="layer">YOU<small>this form</small></div>
+    <div class="arrow">-&gt;</div>
+    <div class="layer">QUEUE<small>bounded, idempotent<br>fair across tenants<br>jobs age upward</small></div>
+    <div class="arrow">-&gt;</div>
+    <div class="layer">ADMISSION<small>capacity check:<br>cpu units, slots,<br>ports, tenant cap</small></div>
+    <div class="arrow">-&gt;</div>
+    <div class="layer">SANDBOX-API<small>T01 control plane</small></div>
+    <div class="arrow">-&gt;</div>
+    <div class="layer">SANDBOXES<small>running your job</small></div>
+  </div>
+  <div class="flows">
+    <div class="flow">
+      <b>Job states:</b>
+      QUEUED -&gt; ADMITTED -&gt; RUNNING -&gt; SUCCEEDED / FAILED / EXPIRED,
+      or -&gt; CANCELLING -&gt; CANCELLED from anywhere.
+      <i>task</i> jobs run your command inside the sandbox then release it.
+      <i>service</i> jobs keep the sandbox until you cancel or max_runtime hits.
+    </div>
+    <div class="flow">
+      <b>Fairness + aging:</b> tenants take turns (least-served first).
+      A waiting job gains +1 effective priority every few seconds (see the
+      aging bonus tick up live in the queue), so nothing starves.
+      A big job that does not fit is skipped, not blocking smaller ones.
+    </div>
+  </div>
+</details>
+
+<section class="capacity">
+  <h2>Cluster capacity <small>what the scheduler may spend</small></h2>
+  <div class="caps">
+    <div class="cap"><label>cpu units</label><div class="bar"><div id="cap-cpu" class="fill"></div></div><span id="cap-cpu-t"></span></div>
+    <div class="cap"><label>sandbox slots</label><div class="bar"><div id="cap-slots" class="fill"></div></div><span id="cap-slots-t"></span></div>
+    <div class="cap"><label>app ports free</label><div class="bar"><div id="cap-ports" class="fill green"></div></div><span id="cap-ports-t"></span></div>
+  </div>
+  <div id="tenants" class="tenants"></div>
+</section>
+
+<section class="submit">
+  <h2>Submit a job</h2>
+  <div class="formgrid">
+    <label>tenant <input id="f-tenant" value="alice" spellcheck="false"></label>
+    <label>name (optional) <input id="f-name" placeholder="my-job" spellcheck="false"></label>
+    <label>template
+      <select id="f-template">
+        <option value="blank">blank (shell, no port)</option>
+        <option value="web">web (httpd + page)</option>
+        <option value="coreapp">coreapp (3-tier app)</option>
+      </select></label>
+    <label>kind
+      <select id="f-kind">
+        <option value="task">task (run cmd, then release)</option>
+        <option value="service">service (keep running)</option>
+      </select></label>
+    <label class="wide">command (task jobs)
+      <input id="f-cmd" value="echo hello from $HOSTNAME; sleep 5" spellcheck="false"></label>
+    <label>priority <span id="f-prio-v">3</span>
+      <input id="f-prio" type="range" min="0" max="9" value="3"></label>
+    <label>count (gang) <input id="f-count" type="number" min="1" max="8" value="1"></label>
+    <label>max_runtime s <input id="f-rt" type="number" min="5" placeholder="empty = forever"></label>
+  </div>
+  <div class="btnrow">
+    <button id="submit">submit job</button>
+    <button id="herd" class="ghost" title="fire 12 small task jobs at once">herd x12</button>
+    <button id="fairdemo" class="ghost" title="6 jobs for tenant-a, then 1 for tenant-b: watch fairness">fairness demo</button>
+  </div>
+  <div id="submitlog" class="submitlog hidden"></div>
+</section>
+
+<section>
+  <h2>Queue <small>queued jobs, sorted by effective priority - watch aging tick</small></h2>
+  <table class="jtable"><thead>
+    <tr><th>#</th><th>job</th><th>tenant</th><th>tmpl</th><th>cpu</th><th>prio</th><th>+aged</th><th>=eff</th><th>age s</th><th></th></tr>
+  </thead><tbody id="queue"></tbody></table>
+  <div id="queue-empty" class="empty">queue is empty</div>
+</section>
+
+<section>
+  <h2>Jobs <small>auto-refreshing every 2s - click a row for details</small></h2>
+  <table class="jtable"><thead>
+    <tr><th>job</th><th>tenant</th><th>kind</th><th>tmpl</th><th>state</th><th>wait</th><th>sandboxes</th><th></th></tr>
+  </thead><tbody id="jobs"></tbody></table>
+  <div id="jobs-empty" class="empty">no jobs yet - submit one above</div>
+</section>
+
+<section class="metrics">
+  <h2>Metrics <small>also at /metrics and /metrics/prometheus</small></h2>
+  <div id="metrics" class="mgrid"></div>
+</section>
+
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-inner">
+    <button class="close" id="close">x</button>
+    <h2 id="d-title"></h2>
+    <div id="d-meta" class="dmeta"></div>
+    <h3>Sandboxes (joined live)</h3>
+    <div id="d-sandboxes"></div>
+    <h3>Task result</h3>
+    <pre id="d-result" class="execout hidden"></pre>
+    <h3>Event timeline</h3>
+    <div id="d-events" class="events"></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

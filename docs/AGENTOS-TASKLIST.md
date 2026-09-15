@@ -131,7 +131,7 @@ Status: **VERIFIED**.
 
 ---
 
-## T02 - `sandbox-scheduler/` - Concurrent Sandbox Scheduler (Phase 7)  [ ]
+## T02 - `sandbox-scheduler/` - Concurrent Sandbox Scheduler (Phase 7)  [x]
 
 **Goal.** A queue + placement engine on top of the T01 API: submit N sandbox
 requests at once; the scheduler admits, queues, places, and reaps them under

@@ -119,6 +119,7 @@ each with explicit edge cases and advanced applications - lives in
 | Folder | Task | Status |
 |---|---|---|
 | [`sandbox-api/`](sandbox-api/) | T01 - Sandbox API (REST control plane over DinD + live web console) | VERIFIED |
+| [`sandbox-scheduler/`](sandbox-scheduler/) | T02 - Concurrent Sandbox Scheduler (queue, fairness, aging, gang jobs) | VERIFIED |
 
 ## Roadmap (in order)
 

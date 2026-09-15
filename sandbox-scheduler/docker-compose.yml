@@ -1,0 +1,56 @@
+# ============================================================================
+#  T02 - SANDBOX SCHEDULER
+#
+#  One service:
+#
+#    scheduler   FastAPI control plane + 4 background loops (placer,
+#                monitor, janitor, cancel-worker). It owns NO docker engine
+#                itself - it drives the T01 sandbox-api over HTTP:
+#
+#      you -> scheduler :9010 -> sandbox-api :9000 -> dind -> sandboxes
+#
+#  PREREQUISITE: the sandbox-api stack (../sandbox-api) must be running.
+#  The scheduler reaches it via host.docker.internal (works on Docker
+#  Desktop out of the box; host-gateway mapping added for Linux).
+#
+#  Ports and all limits are .env-configurable; see .env.example.
+# ============================================================================
+name: sandbox-scheduler
+
+services:
+
+  scheduler:
+    build:
+      context: ./scheduler
+    image: sandbox-scheduler:latest
+    environment:
+      SANDBOX_API_URL: ${SANDBOX_API_URL:-http://host.docker.internal:9000}
+      DB_PATH: /data/scheduler.db
+      CLUSTER_CPU_UNITS: ${CLUSTER_CPU_UNITS:-4}
+      MAX_SCHED_SANDBOXES: ${MAX_SCHED_SANDBOXES:-8}
+      MAX_QUEUE: ${MAX_QUEUE:-50}
+      MAX_PER_TENANT: ${MAX_PER_TENANT:-3}
+      AGING_INTERVAL: ${AGING_INTERVAL:-5}
+      AGING_MAX_BONUS: ${AGING_MAX_BONUS:-6}
+      PLACER_INTERVAL: ${PLACER_INTERVAL:-1}
+      MONITOR_INTERVAL: ${MONITOR_INTERVAL:-2}
+      JANITOR_INTERVAL: ${JANITOR_INTERVAL:-3}
+      JOB_TASK_TIMEOUT: ${JOB_TASK_TIMEOUT:-60}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # no-op on Docker Desktop, needed on Linux
+    volumes:
+      - scheduler-data:/data
+    ports:
+      - "${API_PORT:-9010}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [schednet]
+
+volumes:
+  scheduler-data:    # SQLite: jobs, events, idempotency keys
+
+networks:
+  schednet:
