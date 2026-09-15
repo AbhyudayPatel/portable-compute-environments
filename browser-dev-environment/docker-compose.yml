@@ -1,0 +1,166 @@
+# ============================================================================
+#  COMPANY BROWSER DEVELOPMENT ENVIRONMENT
+#
+#  One command (scripts/start.ps1) brings up:
+#
+#    gitserver    simulated company Git server (source of truth)
+#    repo-init    one-shot: clones core-app into the workspace volume
+#    ide          code-server — VS Code in your browser
+#    backend      FastAPI, hot-reloading from the workspace volume
+#    frontend     nginx, serving the app + proxying /api/* to the backend
+#    db           PostgreSQL
+#
+#  Everything a developer edits lives in the `workspace-data` volume,
+#  which only exists inside Docker — the code never touches the Windows
+#  filesystem. Git is the source of truth; containers are disposable.
+# ============================================================================
+name: company-dev-env
+
+services:
+
+  # ---------------------------------------------------------------- Git ----
+  # Simulated "company private Git server". Hosts core-app.git over the
+  # git:// protocol, seeded from ./seed/company-app on first boot.
+  # DEMO ONLY — anonymous push is enabled; see docs/SECURITY.md.
+  gitserver:
+    build:
+      context: ./infra
+      dockerfile: git.Dockerfile
+    image: company-dev-git-tools
+    entrypoint: ["/usr/local/bin/gitserver-entrypoint.sh"]
+    volumes:
+      - git-data:/srv/git
+      - ./seed/company-app:/seed:ro
+    healthcheck:
+      test: ["CMD", "git", "ls-remote", "git://127.0.0.1/core-app.git"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [devnet]
+
+  # ----------------------------------------------------------- repo-init ---
+  # One-shot job: clones the company repo into the shared workspace volume
+  # before any consumer (IDE, backend, frontend) starts. Owns nothing after
+  # it exits; the volume is the artifact.
+  repo-init:
+    image: company-dev-git-tools
+    depends_on:
+      gitserver:
+        condition: service_healthy
+    volumes:
+      - workspace-data:/workspace
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        if [ ! -d /workspace/core-app/.git ]; then
+          echo "[repo-init] Cloning git://gitserver/core-app.git ..."
+          # A fresh named volume can be pre-populated with empty image
+          # directories (e.g. the backend image's WORKDIR); clear them.
+          rm -rf /workspace/core-app
+          git clone git://gitserver/core-app.git /workspace/core-app
+        else
+          echo "[repo-init] Repository already present, skipping clone."
+        fi
+        # Files must be editable by the `coder` user (uid 1000) in the IDE.
+        chown -R 1000:1000 /workspace
+        echo "[repo-init] Workspace ready."
+    networks: [devnet]
+
+  # ---------------------------------------------------------------- IDE ----
+  # code-server: VS Code in the browser, running inside Linux.
+  ide:
+    build:
+      context: ./ide
+    depends_on:
+      repo-init:
+        condition: service_completed_successfully
+    environment:
+      PASSWORD: ${IDE_PASSWORD:-dev123}
+      GIT_USER_NAME: ${GIT_USER_NAME:-Company Developer}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-dev@company.local}
+    volumes:
+      - workspace-data:/home/coder/workspace
+    ports:
+      - "${IDE_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [devnet]
+
+  # ------------------------------------------------------------ backend ----
+  # Runs the code FROM the workspace volume with hot reload. The image only
+  # carries dependencies — the source is cloned at runtime by repo-init.
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.runtime
+    depends_on:
+      repo-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://company:${POSTGRES_PASSWORD:-company}@db:5432/companydb
+    volumes:
+      - workspace-data:/workspace
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [devnet]
+
+  # ----------------------------------------------------------- frontend ----
+  frontend:
+    image: nginx:1.27-alpine
+    depends_on:
+      repo-init:
+        condition: service_completed_successfully
+      backend:
+        condition: service_started
+    volumes:
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Serves the working copy straight out of the workspace volume.
+      - workspace-data:/srv/workspace:ro
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [devnet]
+
+  # ----------------------------------------------------------------- db ----
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: company
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-company}
+      POSTGRES_DB: companydb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U company -d companydb"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    ports:
+      # Exposed so a DB client on Windows can connect (optional).
+      - "${DB_PORT:-5432}:5432"
+    networks: [devnet]
+
+volumes:
+  workspace-data:   # the checked-out company repo (the "Linux home")
+  git-data:         # the simulated company Git server's repositories
+  pgdata:           # postgres data
+
+networks:
+  devnet:

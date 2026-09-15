@@ -1,0 +1,20 @@
+# Backend RUNTIME image for the browser environment.
+#
+# Deliberately contains NO source code: the source is cloned from the company
+# Git server into the workspace volume at runtime, and this container mounts
+# that volume. uvicorn --reload watches it, so edits made in the browser IDE
+# are live within a second.
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir fastapi==0.115.6 "uvicorn[standard]==0.32.1" psycopg2-binary==2.9.10
+
+EXPOSE 8000
+
+# NOTE: WORKDIR is intentionally just the volume mount point. Creating
+# /workspace/core-app/backend here would pre-populate fresh named volumes
+# with empty directories and break the repo-init clone.
+WORKDIR /workspace
+
+CMD ["uvicorn", "--app-dir", "/workspace/core-app/backend", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--reload", "--reload-dir", "/workspace/core-app/backend"]

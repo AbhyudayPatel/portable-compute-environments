@@ -1,0 +1,63 @@
+# Standalone application stack — "the repo knows how to run itself".
+#
+# This runs JUST the application (backend + frontend + db), without the
+# dev container. Useful for:
+#   - quickly trying the app without the VS Code Dev Containers flow
+#     (see scripts/start-app-stack.ps1)
+#   - CI
+#   - demonstrating that the development tooling and the application
+#     runtime are separate concerns
+name: coreapp
+
+services:
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://company:company@db:5432/companydb
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  frontend:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend:/usr/share/nginx/html:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: company
+      POSTGRES_PASSWORD: company
+      POSTGRES_DB: companydb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U company -d companydb"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "5432:5432"
+
+volumes:
+  pgdata:

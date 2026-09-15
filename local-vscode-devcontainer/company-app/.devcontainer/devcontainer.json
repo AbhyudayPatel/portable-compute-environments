@@ -1,0 +1,35 @@
+{
+  "name": "CoreApp Dev Container",
+
+  // VS Code starts this compose stack, then attaches to the `dev` service.
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "dev",
+  "workspaceFolder": "/workspace",
+
+  // Tooling every developer gets automatically inside the container.
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-azuretools.vscode-docker",
+        "redhat.vscode-yaml"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python3",
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+
+  // So VS Code surfaces the app ports in its "Ports" panel even though
+  // compose already publishes them on the host.
+  "forwardPorts": [3000, 8000],
+
+  // Runs once after the container is created: install the backend's Python
+  // dependencies into the dev container so you can also run/debug the API
+  // from the integrated terminal, and mark the bind-mounted repo safe for git.
+  "postCreateCommand": "pip install -r backend/requirements.txt && git config --global --add safe.directory /workspace",
+
+  // Closing VS Code stops the whole compose stack.
+  "shutdownAction": "stopCompose"
+}

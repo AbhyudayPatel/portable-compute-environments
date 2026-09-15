@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CoreApp — Internal Task Board</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <h1>CoreApp</h1>
+      <p class="tagline">Internal task board — served entirely from the container stack</p>
+    </header>
+
+    <section class="status-card">
+      <span id="api-status" class="pill pill-warn">checking API…</span>
+      <span id="db-status" class="pill pill-warn">checking DB…</span>
+    </section>
+
+    <form id="task-form" class="task-form">
+      <input id="task-title" type="text" maxlength="280"
+             placeholder="Describe the task…" autocomplete="off" required />
+      <button type="submit">Add task</button>
+    </form>
+
+    <ul id="task-list" class="task-list"></ul>
+
+    <footer>
+      <p>
+        Browser <code>:3000</code> &rarr; nginx frontend &rarr; proxies
+        <code>/api/*</code> &rarr; backend container <code>:8000</code> &rarr;
+        PostgreSQL container <code>db:5432</code>
+      </p>
+    </footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

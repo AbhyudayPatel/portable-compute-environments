@@ -1,0 +1,76 @@
+# Compose stack used by VS Code Dev Containers.
+#
+#   VS Code ("Reopen in Container")
+#     -> builds the `dev` image
+#     -> starts ALL services here (dev, backend, frontend, db)
+#     -> attaches VS Code Server to `dev` and mounts the repo at /workspace
+#
+# The app containers are *siblings* of the dev container on one Docker
+# network — not containers inside it (no Docker-in-Docker involved).
+services:
+  dev:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      # The repository root is the workspace. Edits on either side are
+      # visible on the other; the files live on your Windows disk.
+      - ..:/workspace:cached
+    command: sleep infinity
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: ../backend
+    environment:
+      DATABASE_URL: postgresql://company:company@db:5432/companydb
+    volumes:
+      # Hot reload: mount the source over the image's /app.
+      - ../backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+
+  frontend:
+    image: nginx:1.27-alpine
+    volumes:
+      - ../frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../frontend:/usr/share/nginx/html:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: company
+      POSTGRES_PASSWORD: company
+      POSTGRES_DB: companydb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U company -d companydb"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    ports:
+      # Exposed so you can connect a database client from Windows.
+      - "5432:5432"
+
+volumes:
+  pgdata:
