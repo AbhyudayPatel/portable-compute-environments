@@ -110,6 +110,16 @@ adds **no extra versioning layer**: a push is a plain `git push`. If
 automatic commits are wanted, they can be scripted, but they are still
 commits. See `browser-dev-environment/docs/GIT-WORKFLOW.md`.
 
+## AgentOS tasklist
+
+The next generation of this repo - one standalone project folder per task,
+each with explicit edge cases and advanced applications - lives in
+[`docs/AGENTOS-TASKLIST.md`](docs/AGENTOS-TASKLIST.md). Built so far:
+
+| Folder | Task | Status |
+|---|---|---|
+| [`sandbox-api/`](sandbox-api/) | T01 - Sandbox API (REST control plane over DinD + live web console) | VERIFIED |
+
 ## Roadmap (in order)
 
 1. **Reverse-proxy gateway** — one URL with `/ide`, `/app`, `/api`.

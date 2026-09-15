@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sandbox-api console</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div>
+    <h1># sandbox-api <span class="sub">console</span></h1>
+    <div class="crumb">one window into the platform - create, watch, exec, destroy</div>
+  </div>
+  <div id="platform" class="platform">
+    <span class="pill" id="pill-api">api ...</span>
+    <span class="pill" id="pill-dind">dind ...</span>
+    <span class="pill" id="pill-count">sandboxes ...</span>
+  </div>
+</header>
+
+<!-- === HOW IT WORKS - the flow, always visible === -->
+<details id="how" class="how" open>
+  <summary> How this works - what happens when you click things</summary>
+  <div class="layers">
+    <div class="layer"> <b>You</b><small>this browser</small></div>
+    <div class="arrow">-></div>
+    <div class="layer"> <b>API</b><small>localhost:9000<br>decides &amp; records</small></div>
+    <div class="arrow">-></div>
+    <div class="layer"> <b>dind</b><small>a private Docker engine<br>just for sandboxes</small></div>
+    <div class="arrow">-></div>
+    <div class="layer"> <b>sandbox</b><small>own network +<br>containers inside dind</small></div>
+  </div>
+  <div class="flows">
+    <div class="flow">
+      <b>When you CREATE:</b>
+      <ol>
+        <li>name checked (idempotent - same name+spec returns the old one)</li>
+        <li>a port from the pool is allocated (see the pool bar below)</li>
+        <li>images pulled/built <i>inside dind</i></li>
+        <li>a private network + the template's containers start</li>
+        <li>readiness check -> state <span class="badge READY">READY</span></li>
+      </ol>
+      <i>Every step appears live in the sandbox's event log.</i>
+    </div>
+    <div class="flow">
+      <b>When you DELETE:</b>
+      <ol>
+        <li>all its containers are force-removed</li>
+        <li>its private network is removed</li>
+        <li>its port returns to the pool</li>
+        <li>state -> <span class="badge DELETED">DELETED</span>, but the event log stays (audit trail)</li>
+      </ol>
+      <i>Deleting twice -> 404. Deleting while CREATING -> 409.</i>
+    </div>
+  </div>
+</details>
+
+<!-- === PORT POOL - see allocation happen === -->
+<section class="poolwrap">
+  <h2>Port pool <small>one port = the sandbox's front door (localhost:&lt;port&gt;)</small></h2>
+  <div id="pool" class="pool"></div>
+</section>
+
+<!-- === CREATE === -->
+<section class="create">
+  <h2>Create a sandbox</h2>
+  <div class="templates" id="templates">
+    <label class="tcard" data-t="web">
+      <input type="radio" name="template" value="web" checked>
+      <b>web</b>
+      <div class="tdiagram"> 1 container<br><code>busybox httpd :80</code></div>
+      <small>introspection page + /health probe. Gets a port.</small>
+    </label>
+    <label class="tcard" data-t="coreapp">
+      <input type="radio" name="template" value="coreapp">
+      <b>coreapp</b>
+      <div class="tdiagram"> 3 containers<br><code>nginx -> fastapi -> postgres</code></div>
+      <small>a full working task-board app. Gets a port.</small>
+    </label>
+    <label class="tcard" data-t="blank">
+      <input type="radio" name="template" value="blank">
+      <b>blank</b>
+      <div class="tdiagram"> 1 container<br><code>alpine shell</code></div>
+      <small>nothing published - a pure exec target. No port.</small>
+    </label>
+  </div>
+  <div class="createrow">
+    <input id="cname" placeholder="name (e.g. my-test)" spellcheck="false">
+    <input id="cttl" type="number" min="10" placeholder="TTL seconds (optional - self-destruct)">
+    <button id="create">> create</button>
+  </div>
+  <div id="createlog" class="createlog hidden"></div>
+</section>
+
+<!-- === SANDBOX LIST === -->
+<section>
+  <h2>Sandboxes <small id="refresh-note">auto-refreshing every 2s</small></h2>
+  <div id="list" class="list"></div>
+  <div id="empty" class="empty">no sandboxes yet - create one above </div>
+</section>
+
+<!-- === DETAIL DRAWER === -->
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-inner">
+    <button class="close" id="close">x</button>
+    <h2 id="d-title"></h2>
+    <div id="d-meta" class="dmeta"></div>
+
+    <h3> What's inside <small>live from the engine</small></h3>
+    <table class="ctable"><thead>
+      <tr><th>container</th><th>role</th><th>image</th><th>status</th><th>health</th></tr>
+    </thead><tbody id="d-containers"></tbody></table>
+
+    <h3> Run a command inside</h3>
+    <div class="execbox">
+      <select id="exec-container"></select>
+      <input id="exec-cmd" placeholder='e.g.  hostname ;  ip addr ;  ps aux ;  cat /etc/os-release' spellcheck="false">
+      <input id="exec-timeout" type="number" min="1" max="300" value="30" title="timeout seconds">
+      <button id="exec-run">run</button>
+    </div>
+    <pre id="exec-out" class="execout hidden"></pre>
+
+    <h3> Event timeline <small>what the platform did, in order</small></h3>
+    <div id="d-events" class="events"></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,75 @@
+# ============================================================================
+#  T01 - SANDBOX API
+#
+#  Two services:
+#
+#    dind   a dedicated Docker-in-Docker engine. Sandboxes live INSIDE it.
+#           Its daemon API (2375, no TLS) is reachable ONLY on the internal
+#           compose network - it is never published to the Windows host.
+#           Its published port range (POOL_START..POOL_END) is the identity
+#           mapping through which sandbox apps become reachable from the
+#           Windows browser: sandbox web port 80 -> dind binds port P ->
+#           Docker Desktop forwards localhost:P.  (Same trick as
+#           docker-nested-lab, but allocated dynamically per sandbox.)
+#
+#    api    the FastAPI control plane. Talks to dind over tcp://dind:2375
+#           with the official docker SDK. Keeps metadata in SQLite (a
+#           volume). Reconciles DB <-> engine on every boot.
+#
+#  Ports are .env-configurable; see .env.example.
+# ============================================================================
+name: sandbox-api
+
+services:
+
+  dind:
+    image: docker:27-dind
+    privileged: true                       # required to run dockerd inside
+    environment:
+      DOCKER_TLS_CERTDIR: ""               # plain 2375 on the internal net
+    volumes:
+      - dind-data:/var/lib/docker          # inner images/layers persist
+    ports:
+      # Identity range: inner published port P == dind port P == localhost:P
+      - "${POOL_START:-9200}-${POOL_END:-9209}:${POOL_START:-9200}-${POOL_END:-9209}"
+    dns: [1.1.1.1, 8.8.8.8]                # dind needs real DNS for pulls
+    healthcheck:
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    networks: [sandnet]
+
+  api:
+    build:
+      context: ./api
+    image: sandbox-api:latest
+    depends_on:
+      dind:
+        condition: service_healthy
+    environment:
+      DOCKER_HOST: tcp://dind:2375
+      DB_PATH: /data/sandbox-api.db
+      POOL_START: ${POOL_START:-9200}
+      POOL_END: ${POOL_END:-9209}
+      MAX_SANDBOXES: ${MAX_SANDBOXES:-12}
+      REAPER_INTERVAL: ${REAPER_INTERVAL:-5}
+    volumes:
+      - api-data:/data
+    ports:
+      - "${API_PORT:-9000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [sandnet]
+
+volumes:
+  dind-data:    # inner engine: images, layers, containers
+  api-data:     # SQLite metadata store
+
+networks:
+  sandnet:
+    internal: false   # dind must reach the internet for image pulls
