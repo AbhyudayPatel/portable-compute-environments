@@ -1,0 +1,23 @@
+# ============================================================================
+#  sandbox-sim - deterministic simulation testing (DST) of the control plane
+#
+#  No Docker engine, no network, no clock: the sandbox-api lifecycle core is
+#  driven in-process against a fake engine and a virtual clock, thousands of
+#  seeded random scenarios per minute, with faults (engine outages, container
+#  deaths, out-of-band removals, partial creates, process crashes, clock
+#  skew) and invariants checked after every step.
+#
+#    docker compose run --rm sim                       # 300 seeds x 300 steps
+#    docker compose run --rm sim python -m sim.run --seed 17 --verbose
+#    docker compose run --rm sim pytest -q             # unit + property tests
+# ============================================================================
+name: sandbox-sim
+
+services:
+  sim:
+    build:
+      context: .
+      additional_contexts:
+        app: ../sandbox-api/api/app
+        sched: ../sandbox-scheduler/scheduler/app
+    image: sandbox-sim:local

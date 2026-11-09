@@ -1,35 +1,76 @@
-# sandbox-api - Edge Cases (each mapped to code + test)
+# sandbox-api v2 - Edge Cases
 
-Status legend: **VERIFIED** = executed and observed by `scripts/verify.sh`;
-**EXPECTED** = reasoned, not executed.
+Legend: **VERIFIED** = executed and observed by `scripts/verify.sh`
+(89 assertions, 17 sections) or by the simulator (`../sandbox-sim`,
+76 tests + 500 seeded fuzz runs). **EXPECTED** = reasoned, not executed.
+
+## Lifecycle (v1 contract, re-verified on v2)
 
 | # | Edge case | Handling (code) | Test |
 |---|---|---|---|
-| 1 | Idempotent create | `POST /sandboxes` looks the name up first: same spec -> `200` + existing sandbox; different spec -> `409`. Uniqueness enforced by the `name UNIQUE` column. | verify 3, 4 - **VERIFIED** |
-| 2 | Port-pool exhaustion | `store.alloc_port()` returns `None` when full -> row set `FAILED`, event logged, `429` + `Retry-After`. Nothing was created yet, so nothing to roll back; the FAILED row holds **no port**. | verify 6 - **VERIFIED** |
-| 3 | Partial creation failure | `engine.create_sandbox_resources()` wraps the whole sequence; any exception runs `rollback()` (force-removes created containers, removes network) then re-raises. Provision thread marks `FAILED` with the error and frees the port. | exercised by design; a forced-failure run (bad image tag) observed event `create failed: ...` with zero leftover containers - **VERIFIED** |
-| 4 | API crash / restart | `engine.reconcile()` at startup adopts engine orphans, finishes interrupted deletes, rolls back interrupted creates, and syncs disagreeing states. | verify 12 (create -> `docker compose restart api` -> sandbox still `READY`) - **VERIFIED** |
-| 5 | Foreign-container safety | Every engine call filters on `label sandbox.managed=true`; hand-created containers in dind are invisible to list/delete/reconcile. | manual container created in dind survived verify + reconcile untouched - **VERIFIED** |
-| 6 | Exec edge cases | `409` unless state `READY`; per-call timeout (bounded <=300 s) returns `timed_out:true` with partial output; streams capped at 64 KiB with `truncated:true`; non-zero exit codes returned in-band. | verify 5 (exit 7, stderr capture, 2 s timeout on `sleep 30`, 200 KB output) - **VERIFIED** |
-| 7 | Delete idempotency | Missing/`DELETED` -> `404`; `CREATING` -> `409`; concurrent delete+reaper serialized by the per-sandbox lock, both paths idempotent. | verify 9 - **VERIFIED** |
-| 8 | DinD unavailable | `engine.ping()` gate on mutating endpoints -> `503` + `Retry-After: 5`; `/healthz` reports `"dind":"down"`; docker client timeout is 8 s so calls fail fast instead of hanging. Startup survives dind being down (reconcile skipped, logged). | `docker pause` on dind -> `503` observed; unpause -> recovery - **VERIFIED** |
-| 9 | TTL race | Reaper and manual DELETE both go through `_lock_for(sid)` and re-read the row inside the lock; loser sees `DELETED` and backs off. | loop of 50 TTL-vs-delete races, zero torn sandboxes - **VERIFIED** (dev test) |
-| 10 | Capacity cap | `MAX_SANDBOXES` checked against `engine.engine_sandbox_ids()` (label-derived, survives DB wipe); over cap -> `429` + `Retry-After: 30`. | `MAX_SANDBOXES=3` run: 4th create -> 429 - **VERIFIED** |
-| 11 | Name validation | Pydantic validator enforces `^[a-z0-9][a-z0-9-]{1,40}$`; unknown template rejected with the valid list. Both -> `422`. | verify 10 - **VERIFIED** |
-| 12 | Event-log integrity | `store.add_event()` computes `MAX(seq)+1` per sandbox under the write lock - no gaps/dupes even under concurrency; `GET .../events` returns seq-ordered history incl. reconcile entries after restarts. | verify 11 - **VERIFIED** |
+| 1 | Idempotent create | same name+spec -> 200 existing; different spec -> 409; `name UNIQUE` + tombstoning on delete | verify 4; sim `test_idempotent_create_same_spec_returns_existing` |
+| 2 | Port-pool exhaustion | `alloc_port` None -> row FAILED (no port), 429 + Retry-After, nothing created | verify 13; sim `test_port_exhaustion_...` |
+| 3 | Partial creation failure | `create_sandbox_resources` rollback closure removes everything it made; provision marks FAILED and frees the port | sim `test_partial_create_failure_rolls_back_and_frees_port` (fault: container 2 of 3 fails) |
+| 4 | API crash / restart | boot `reconcile()`: adopt orphans, finish interrupted deletes, roll back orphaned CREATING rows, sync states, re-anchor TTLs | verify 16; sim `test_crash_mid_create_is_rolled_back_on_boot` + random crashes in every fuzz seed |
+| 5 | Foreign-container safety | every engine call filters on `sandbox.managed=true` | by construction (unchanged) |
+| 6 | Exec edge cases | 409 unless READY/DEGRADED; timeout **kills** the process group (exit 143) - no leftover process; 64 KiB caps with `truncated:true` and the true `bytes_total`; non-zero exit in-band | verify 5 |
+| 7 | Delete idempotency | missing/DELETED -> 404; CREATING -> 409; reaper vs delete serialized by the per-sandbox lock | verify 15; sim `test_reaper_vs_delete_race_is_idempotent` |
+| 8 | Engine unavailable | `ping()` gate -> 503 + Retry-After; 8 s client timeout; boot survives dind down | sim `test_engine_down_gives_503_never_hangs`; fuzz `engine_down` fault |
+| 9 | TTL race | reaper and manual delete both lock + re-read; loser sees DELETED | sim (every fuzz seed mixes reaper sweeps and deletes) |
+| 10 | Capacity cap | `MAX_SANDBOXES` vs engine-derived count -> 429 | sim invariant I3 (engine never over capacity) |
+| 11 | Name validation | `^[a-z0-9][a-z0-9-]{1,40}$`; unknown template; unsupported isolation -> 422 | verify 4 |
+| 12 | Event-log integrity | `MAX(seq)+1` under the write lock; contiguous; readable after deletion | verify 3, 15; sim invariant I4 |
 
-## Known limits (deliberate, documented - not bugs)
+## New in v2
 
-- **Single API process**: per-sandbox locks and the alloc write-lock live in
-  process memory. Horizontal scaling of the API is a T12 concern (the
-  distributed scheduler owns placement; this API stays per-engine).
-- **`deadline_mono` doesn't survive API restart** (monotonic clocks are
-  per-process). On boot, sandboxes with a TTL get a fresh deadline of
-  `now + ttl_seconds` - documented in IMPLEMENTATION.md; the reaper keeps
-  working, the expiry just slides by one restart. (Fix lands with the
-  T07 event store: wall-clock deadlines derived from replayed events.)
-- **Blank template has no port**; identity mapping applies only to
-  port-holding templates (`web`, `coreapp`).
-- Coreapp first-create latency is dominated by building its two images
-  inside dind (cached afterwards in `dind-data`). `READY_TIMEOUT_COREAPP`
-  (default 180 s) bounds the readiness wait; the create itself is async.
+| # | Edge case | Handling | Test |
+|---|---|---|---|
+| 13 | **TTL across restarts** | `deadline_wall` stored; boot reconcile re-derives `deadline_mono`; the reaper never compares wall clocks | verify 14 (restart mid-TTL: deadline unchanged, fires on time); sim `test_ttl_survives_restart_via_wall_deadline` + mutation test proving the sim catches the v1 bug |
+| 14 | **Container dies under a READY sandbox** | informer `die`/`oom` -> DEGRADED with `detail.dead`; `start` restarts dead containers -> READY | verify 11; sim `test_informer_marks_degraded_and_start_heals` |
+| 15 | **stop() emits die events too** | handler re-reads state under the lock; STOPPED explains the events -> ignored | sim `test_stop_then_die_events_do_not_degrade` + mutation `test_catches_informer_ignoring_stop_lock` |
+| 16 | **Containers removed outside the API** (`docker rm -f` inside dind) | informer `destroy` -> if nothing left in engine: DELETED, port freed | verify 12; sim `test_out_of_band_removal_marks_deleted_and_frees_port` |
+| 17 | **Resync vs in-flight create** | `core.in_flight` registered in `create()` (not when the thread starts): reconcile never rolls back an owned CREATING row | verify 13 was the detector (rollback 20 ms after create); sim fuzz |
+| 18 | **API boots while dind is down** | `boot_pending` stays true; the first periodic resync that reaches the engine runs in boot mode | sim fuzz (`CRASH` while `ENGINE DOWN`) - this was the first bug the simulator found |
+| 19 | **FAILED row with leftovers** (engine went down mid-rollback) | reconcile destroys engine resources of FAILED rows | sim invariant Q1 "FAILED owns nothing" |
+| 20 | **Provision rolled back under it** | generator re-checks `CREATING` between steps; aborts and destroys what it created | sim fuzz (seed 20 found it) |
+| 21 | Session resume | `?since=` replays from the ring; eviction reported as `{"gap":true}` | verify 6 (resume returns only new frames); agent test (2 KiB ring, 20 KiB output -> gap + dropped_frames) |
+| 22 | Session kill / delete | signal to process group; delete kills if running; 404 after delete | verify 6 |
+| 23 | Pty resize | `TIOCSWINSZ` on the pty; `stty size` reflects it | verify 6 |
+| 24 | Tar path escape on upload | entry names cleaned relative to the destination; `../../etc/evil` lands under the destination | verify 7 |
+| 25 | File jail | `SBX_AGENT_FS_ROOT` + symlink resolution of the deepest existing ancestor | agent code; templates use `/` today (EXPECTED for a jailed template) |
+| 26 | Fingerprint determinism | sorted walk, mtimes ignored; same tree -> same root; one byte -> new root | verify 8 |
+| 27 | Diff of unrelated sandboxes | per-entry comparison; self-diff identical | verify 8 |
+| 28 | DB fingerprint | rows hashed in canonical order; insert changes the table hash and the root | verify 9 |
+| 29 | gVisor unavailable | create with `isolation:gvisor` -> 400 if the engine has no `runsc` | code path; EXPECTED (engine always has it here) |
+| 30 | gVisor + published port + Postgres | verified: web under runsc serves through the identity port; Postgres starts under runsc (init-restart window: connect via TCP or retry) | verify 10; standalone probe in IMPLEMENTATION.md |
+| 31 | Desktop readiness | agent started via `docker exec` (s6 stays PID 1); readiness = agent + KasmVNC HTTP | verified manually (IMPLEMENTATION.md); not in verify.sh because the first build pulls a 3.9 GB base |
+| 32 | Init hooks from a Windows build context | linuxserver init refuses non-executable hooks; Dockerfile `chmod +x` | verified (the first build silently skipped the hook) |
+| 33 | API restart mid-`exec`/session | sessions live in the agent: the API restart loses nothing; resume with `since=` | verify 16 is the restart; session continuity EXPECTED (agent-side verified by the standalone agent test) |
+| 34 | Engine (dind) restart | all inner containers stop; reconcile marks sandboxes STOPPED; `start` resumes them; exec-mode agents are relaunched by start | observed during the build (IMPLEMENTATION.md) |
+| 35 | Wall-clock skew | reaper uses monotonic deadlines only; wall is used once at boot | sim fuzz `skew` fault |
+| 36 | SSE resume | per-sandbox `since=` and global `cursor=` replay from the store, then live; 15 s heartbeats; bounded lifetime | verify 17 |
+
+## Stateful volumes and pause (used by ../sandbox-checkpoint)
+
+| # | Edge case | Handling | Test |
+|---|---|---|---|
+| 37 | Overlay on the wrong filesystem | overlay refuses `upperdir` on overlayfs; volumes live on the ext4 `sbx-state` volume | probed during the build (IMPLEMENTATION.md) |
+| 38 | Root-owned archive dir | Postgres archives as uid 70; template declares `chown` for plain binds | checkpoint verify 2 (WAL segments appear) |
+| 39 | Stop while PAUSED | 409 "unpause before stopping" (a frozen process cannot handle SIGTERM) | code path; sim fuzz `pause`/`stop` steps |
+| 40 | Reconcile sees paused containers | engine state `PAUSED` when every container is running-or-paused and at least one is paused | sim invariant Q2 |
+| 41 | Delete of a stateful sandbox | `destroy_sandbox_resources` unmounts and removes `/var/lib/sbx/vol/<sid>` (idempotent, no-op for stateless) | checkpoint verify cleanup; node dir gone |
+| 42 | Create rollback with volumes | rollback closure also tears volumes down | code path (EXPECTED) |
+| 43 | Node ops path restriction | `/node/*` only accept `/var/lib/sbx/...`; `DELETE /node/dir` only `/var/lib/sbx/ckpt/...` | checkpoint verify 10, 12 |
+
+## Known limits (deliberate, documented)
+
+- **Single API process.** Locks, `in_flight`, the bus live in memory.
+  Horizontal scaling is a T12 concern.
+- **Agent injection requires a writable root** (put_archive to `/sbx`).
+  Read-only root images need a volume mount - EXPECTED, not implemented.
+- **`desktop` is container-only** and heavy (3.9 GB base image, ~500 MB
+  RAM live). One desktop at a time on a 3.4 GB Docker Desktop VM.
+- **No auth on the API** (unchanged; see SECURITY.md). Agent tokens
+  protect sandbox-to-sandbox, not client-to-API.
+- **Upload endpoints buffer the body in the API** before relaying (tar
+  upload of hundreds of MB would need a streaming relay).

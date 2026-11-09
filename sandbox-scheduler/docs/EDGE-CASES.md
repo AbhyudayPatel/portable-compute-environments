@@ -1,40 +1,46 @@
-# sandbox-scheduler - Edge Cases
+# sandbox-scheduler v2 - Edge Cases
 
-Each edge case: how it is handled in code, and the verify.sh section that
-proves it. All **VERIFIED** (41/41 passing) unless marked otherwise.
+**VERIFIED** = `scripts/verify.sh` (v1 sections 1-16 re-run on v2, plus
+17-20) or the simulator (`../sandbox-sim/sim/sched.py`, `tests/test_sched.py`).
+
+## v1 cases (unchanged contract, re-verified)
 
 | # | Edge case | Handling | Test |
 |---|---|---|---|
-| 1 | Thundering herd | One global admission lock serializes all placement decisions; capacity math uses DB reservations + engine truth, so N concurrent submits can never oversubscribe. Concurrency sampler in verify watches ADMITTED+RUNNING never exceed CLUSTER_CPU_UNITS during a 50-job herd. | 5+6 - VERIFIED |
-| 2 | Priority inversion | Aging: +1 effective priority per AGING_INTERVAL queued, capped. A long-waiting low-priority job eventually outranks fresh high-priority ones. | 9 - VERIFIED (aged prio-5 job beat fresh prio-6) |
-| 3 | Starvation | Same mechanism, plus fair queueing across tenants: the least-served tenant is considered first every placement tick. | 7 - VERIFIED (tenant-b admitted while 3 tenant-a jobs waited) |
-| 4 | Crash mid-admission | Self-stabilizing: on restart, ADMITTED/RUNNING jobs are re-derived from engine state by sandbox name (`sched-<jobid>-<k>`); sandboxes created just before the crash whose job never recorded them are reaped as orphans by the janitor. | 15 - VERIFIED (docker restart: jobs RUNNING kept, no duplicates, planted orphan reaped) |
-| 5 | Duplicate submission | `Idempotency-Key` header, UNIQUE in DB. Same key + same body -> 200 with the existing job; same key + different body -> 409; concurrent same-key inserts -> loser re-reads and returns the winner's row. | 4 - VERIFIED |
-| 6 | Cancel races | QUEUED -> CANCELLED instantly (never admitted). ADMITTED/RUNNING -> CANCELLING; the cancel loop retries deletes (upstream 409 while sandbox CREATING is retried, 404 = already gone is success). Terminal -> 409. CANCELLING -> idempotent 200. 30-iteration race loop asserts zero leaked sandboxes and zero stuck jobs. | 10, 11 - VERIFIED |
-| 7 | Downstream outage | All upstream calls timeout-bounded (8 s); errors/503 -> UpstreamDown -> loops skip the tick and set `upstream_down` in /metrics. Jobs wait in place. Provisioning threads requeue their job. Recovery is automatic. | 14 - VERIFIED (stop sandbox-api: job stays QUEUED, flag set, completes after restart) |
-| 8 | Clock skew / TTL | Deadlines computed on the monotonic clock at admission (`deadline_mono`), never compared across wall-clock changes. Wall deadline also stored so a restart re-anchors the monotonic deadline with the true remaining time. | 13 + 15 - VERIFIED |
-| 9 | Queue bound | `MAX_QUEUE` (default 50) enforced at submit; over the bound -> 429 + Retry-After. The queue can never grow unboundedly and eat memory. | 5 - VERIFIED (55 submits -> 5x 429) |
-| 10 | Head-of-line blocking | Skip-and-fill: within a tenant, jobs that don't fit are skipped; smaller jobs behind them admit. Also across tenants (next tenant's jobs tried). | 8 - VERIFIED (3-cpu blocker running, 2-cpu job queued, 1-cpu job ran past it) |
+| 1 | Thundering herd | single admission lock; capacity from reservations + engine truth | verify 5-6 (50 jobs, never > 4 active) |
+| 2 | Priority inversion | aging (+1 per 5 s, cap +6) | verify 9 |
+| 3 | Starvation | aging + least-served-tenant-first | verify 7 |
+| 4 | Crash mid-admission | `reconcile()`: re-anchor clocks; **ADMITTED jobs re-queued** (new); monitor re-derives RUNNING by name; janitor reaps orphans | verify 15; sim `test_random_scheduler_scenarios` (scheduler crashes every run) |
+| 5 | Duplicate submission | Idempotency-Key UNIQUE; same body 200, different 409 | verify 4 |
+| 6 | Cancel races | QUEUED/PREEMPTED -> CANCELLED at once; ADMITTED/RUNNING/PREEMPTING -> CANCELLING with retried deletes | verify 10-11 |
+| 7 | Downstream outage | `UpstreamDown` on every loop; jobs wait; provisioning requeues | verify 14 |
+| 8 | Clock skew / TTL | monotonic deadlines + wall re-anchor on boot | verify 13, 15; sim skew fault |
+| 9 | Queue bound | 429 past `MAX_QUEUE` | verify 5; sim S6 (depth may transiently exceed by in-flight admissions after a crash re-queue - documented) |
+| 10 | Head-of-line blocking | skip-and-fill | verify 8 |
 
-## Beyond the list - extra cases this implementation covers
+## v2 cases
 
-| Edge case | Handling |
-|---|---|
-| Gang partial failure | `count: N` admission is all-or-nothing; if sandbox k of N fails upstream, all k-1 created sandboxes are deleted and the job FAILEDs. Oversized gangs (count > capacity) sit QUEUED forever, never partially admitted (cancel to clear). | 12 - VERIFIED |
-| Sandbox dies under a RUNNING service job | Monitor notices the missing sandbox -> job FAILED ("sandbox vanished"), siblings deleted. | code path exercised; EXPECTED (hard to time deterministically in a script) |
-| Exec timeout inside a task job | task commands run with JOB_TASK_TIMEOUT (60 s) via the sandbox-api exec caps; a hanging task ends FAILED with `timed_out: true` in its result. | 3-adjacent - VERIFIED via exit-code capture |
-| Concurrent same-key submits | sqlite UNIQUE on idem_key + IntegrityError catch -> winner's row returned. | 4 covers replay; race variant EXPECTED (both requests still return one job) |
-| admin/reset with live sandboxes | reset only wipes rows; the janitor's name-correlated orphan sweep reaps the live sandboxes, so nothing leaks. | 15 orphan assertion - VERIFIED |
-| Duplicate sandbox names | scheduler sandboxes are always `sched-<jobid>-<k>` and job ids are uuids - name reuse after deletion is handled by sandbox-api's tombstoning (T01 edge #7b). | by construction |
+| # | Edge case | Handling | Test |
+|---|---|---|---|
+| 11 | **Deadline ordering** | among equal effective priority, earliest `deadline_at` first | verify 17; sim `test_edf_orders_equal_priority_by_deadline` |
+| 12 | **Deadline missed** | `_finish` compares `finished_at` with `deadline_at`; flag + counter | verify 18; sim `test_deadline_miss_is_counted` |
+| 13 | **Preemption** | head blocked on CPU with effective priority >= 8 -> lowest-priority preemptible+stateful single services checkpointed, deleted, PREEMPTED (+3 bonus); resumed by fork | verify 19; sim `test_preemption_evicts_...` |
+| 14 | **Preemption candidate across tenants** | the head is the best job blocked on CPU across all under-cap tenants, not the first tenant's head | sim (found: 0 preemptions in 40 seeds before the fix) |
+| 15 | **Non-stateful or task jobs are never victims** | `choose_victims` filters on kind/preemptible/stateful/count | sim `test_non_stateful_jobs_are_never_preempted` |
+| 16 | **Cannot free enough** | no victims taken at all (never a partial eviction) | `choose_victims` returns [] |
+| 17 | **Checkpoint service down** | preemption aborts, victim back to RUNNING, `checkpoint_down` metric, head keeps waiting | sim `test_preemption_aborts_cleanly_when_checkpoint_service_is_down` |
+| 18 | **Crash during preemption** | PREEMPTING -> RUNNING on boot; a later tick preempts again cleanly | sim `test_scheduler_crash_during_preemption_recovers` |
+| 19 | **Resume when the engine is down** | provision generator requeues to PREEMPTED (not QUEUED) so the checkpoint is kept | `provision_steps` |
+| 20 | **Preempted job cancelled** | PREEMPTED -> CANCELLED directly (no sandbox to tear down) | `cancel()` |
+| 21 | **Memory budget** | observed cgroup memory + estimate for the new job > budget -> no admission, `memory_refusals_total` | verify 20 (1-byte budget) |
+| 22 | **Budget derived from the engine** | `MEMORY_BUDGET_BYTES` empty -> 75% of engine RAM from `/status` | `engine_view()` |
+| 23 | **Gang jobs and preemption** | gangs are never preempted and never preempt partially (count must be 1) | `submit()` forces preemptible=false for count>1 |
 
-## Known limits (deliberate - documented, not bugs)
+## Known limits
 
-- **Single scheduler process.** Two scheduler replicas would double-place;
-  leader election is T12's job (Postgres advisory locks), by design.
-- **Unmanaged sandboxes** cost a flat 1 cpu unit in the model - the engine
-  has no unit annotation for them. T03 (quotas) makes units real cgroups.
-- **Aging is priority-level, not preemptive** - a running low-priority job
-  is never evicted; preemption needs checkpoints (T05) to be safe.
-- **Task results** are capped by the sandbox-api exec caps (64 KiB/stream).
-- **`/admin/reset` exists for demos/tests** and would be removed or
-  auth-gated in any shared deployment (see SECURITY.md).
+- Preemption frees CPU units only; a job blocked by slots/ports/tenant cap
+  does not trigger it.
+- The memory estimate for unmeasured jobs is a constant per cpu unit;
+  real per-template profiles would be better (T03).
+- Gang preemption and preemption of non-stateful services (would lose
+  state) are deliberately unsupported.

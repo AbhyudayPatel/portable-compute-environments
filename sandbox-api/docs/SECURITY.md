@@ -1,48 +1,84 @@
-# sandbox-api - Security Notes
+# sandbox-api v2 - Security Notes
 
-This is a **local development demo**, in the same trust posture as the rest
-of the repo. Here is exactly what is trusted and what must change before
-any shared/hosted use.
+Same local-development posture as v1, with new surfaces that need to be
+understood: the agent inside every container, the privileged node
+operations on the engine, gVisor as an optional stronger boundary, and a
+desktop that runs a browser.
 
 ## What this demo trusts
 
-1. **The inner engine API (2375) is plaintext and unauthenticated.** It is
-   reachable ONLY on the internal compose network - compose never publishes
-   it to the host. The blast radius if the `api` container is compromised:
-   full control of the inner engine (which is itself a privileged
-   container - see next).
-2. **`dind` runs `--privileged`.** That is root-equivalent on the host.
-   This is a lab; the honest escape hatches are T11 (microVM isolation)
-   and rootless/sysbox runtimes. Do not expose sandbox workloads you don't
-   trust at the "I wouldn't run this as root" level.
-3. **No auth on the REST API.** Anyone who can reach `localhost:9000` can
-   create/destroy sandboxes. Fine on a single-developer laptop; not fine
-   on a shared host (bind to localhost, or put an auth gateway in front  - 
-   that is T04's bearer-token design).
-4. **Exec is arbitrary command execution** inside the sandbox. That is the
-   point of the product, but it means the API is a remote-code-execution
-   service by design - treat it accordingly.
+1. **The REST API has no authentication.** Anyone reaching
+   `localhost:9000` can create sandboxes, run commands in them, read and
+   write their files, drive their GUI. Bind to localhost (compose does
+   not restrict this) and treat the machine as single-user.
+2. **`dind` runs `--privileged`** and its daemon API (2375) is plaintext.
+   Both are reachable only on the compose network. A compromise of the
+   `api` container is a compromise of the engine.
+3. **The node token** (`SBX_NODE_TOKEN`) authorises `/node/exec`, which is
+   root inside the privileged dind container. It is shared via `.env`
+   and never leaves the compose network. Change it anyway; it is a
+   placeholder by default.
+4. **Agent tokens** are per sandbox, random, carried in the container's
+   environment (`SBX_AGENT_TOKEN`) and the API's SQLite. They stop one
+   sandbox from driving another's agent. They are visible to any process
+   inside that sandbox - by design, the sandbox is one trust domain.
+5. **The agent runs as root in the container** and the file jail is a
+   policy knob (`SBX_AGENT_FS_ROOT`), not a boundary against the sandbox's
+   own root.
+
+## Isolation levels, honestly
+
+| Level | What stands between the workload and the host kernel | When to use |
+|---|---|---|
+| `container` (runc in dind) | namespaces + cgroups + seccomp of the inner engine, inside a privileged outer container | trusted or your own code |
+| `gvisor` (runsc in dind) | gVisor's userspace kernel (Sentry) + a narrow syscall surface to the host kernel + the inner engine's namespaces, still inside the privileged outer container | code you did not write: agents, PR previews |
+| microVM (T11, not here) | a hardware virtualisation boundary | hostile multi-tenant |
+
+gVisor materially reduces the attack surface (the workload cannot reach
+most host syscalls), but the outer dind container is still privileged:
+a gVisor escape *plus* a container escape would be needed to reach the
+Windows VM. For this lab that is a large step up; for production use
+microVMs.
+
+## The desktop template
+
+- Chromium runs with `--no-sandbox`: its *inner* sandbox cannot create
+  namespaces under the engine's default seccomp profile. The container is
+  the boundary. Do not browse hostile sites with it unless you accept
+  "the container is compromised" as the outcome.
+- KasmVNC serves without a password by default; it is reachable only via
+  the identity port on localhost.
+- The GUI API can type anything into anything; it is as powerful as a
+  person at the keyboard. Audit: every action is recorded in the sandbox
+  event log (`type: gui`).
+
+## Secrets
+
+- Nothing in this project needs a secret except the node token. Do not
+  pass secrets to sandboxes through `cmd` (exec commands are logged in
+  events) or through template environment (visible in `docker inspect`
+  inside dind). The egress project's placeholder-credential scheme is
+  the intended path.
 
 ## What a real deployment changes (checklist)
 
-- [ ] AuthN/Z on every route (API gateway or middleware); per-tenant
-      sandbox scoping.
-- [ ] Bind published ports to `127.0.0.1`, not `0.0.0.0`.
-- [ ] TLS on 2375 if the API and engine ever live on different machines
-      (or better: workers dial OUT to the control plane - T12's model).
-- [ ] Replace privileged DinD with microVMs (T11) or rootless+sysbox.
-- [ ] Resource quotas by default (T03), network egress policy per sandbox.
-- [ ] Secrets via indirection only (T13's IR forbids inline secrets);
-      never in labels/events - the event log is plaintext today.
-- [ ] Image allowlist for templates.
-- [ ] Audit log of API callers (T07 event store with caller identity).
+- [ ] AuthN/Z on every API route; tenant-scoped sandbox visibility.
+- [ ] Bind published ports to `127.0.0.1`; TLS in front of the API.
+- [ ] Rotate `SBX_NODE_TOKEN`; keep `/node/*` reachable only from the API.
+- [ ] Default `isolation=gvisor` for untrusted workloads; microVMs for
+      hostile ones.
+- [ ] Per-sandbox resource limits (`mem_limit`, `nano_cpus`, `pids_limit`
+      are plumbed through `templates.py` container specs; defaults are
+      unlimited today).
+- [ ] Egress policy per sandbox (the `sandbox-egress` project).
+- [ ] Image allowlist for templates; pinned digests (gVisor already is).
+- [ ] Jail the agent's file API per template (`fs_root`) for templates
+      that expose files to third parties.
 
 ## What we DO verify today
 
-- The management-label contract: the API cannot touch foreign containers
-  even by accident (EDGE-CASES.md #5).
-- Path-naive inputs rejected at validation (#11), so container names stay
-  DNS-safe and injection-free through the Docker API (no shell is ever
-  involved in create/delete - all SDK calls).
-- No secrets appear in `/events` payloads: events carry state transitions
-  and short action summaries, never env vars or request bodies.
+- Management-label contract: the API never touches foreign containers.
+- Tar uploads cannot escape their destination (verify 7).
+- Timed-out commands are killed, not abandoned (verify 5).
+- gVisor sandboxes report the gVisor kernel and still work (verify 10).
+- No secrets in `/events` payloads (commands are logged, outputs are not).

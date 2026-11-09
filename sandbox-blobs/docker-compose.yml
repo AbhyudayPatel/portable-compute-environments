@@ -1,0 +1,43 @@
+# ============================================================================
+#  sandbox-blobs - content-addressed blob store (CAS)
+#
+#  One service. Bytes live in the `blob-data` volume under
+#  /blobs/sha256/<ab>/<sha256>; the SQLite index (refs, pins, sizes) lives
+#  next to them. Everything is streamed: a 1 GiB upload uses a few MB of
+#  RAM in the service.
+#
+#    you / other projects --> http://localhost:9400
+# ============================================================================
+name: sandbox-blobs
+
+services:
+  blobs:
+    build:
+      context: ./api
+    image: sandbox-blobs:local
+    environment:
+      BLOB_ROOT: /blobs
+      DB_PATH: /blobs/index.db
+      MAX_BLOB_BYTES: ${MAX_BLOB_BYTES:-8589934592}
+      GC_GRACE_SECONDS: ${GC_GRACE_SECONDS:-60}
+    volumes:
+      - blob-data:/blobs
+    ports:
+      - "${BLOBS_PORT:-9400}:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 256M        # proves streaming: a 500 MB upload must fit
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [blobnet]
+
+volumes:
+  blob-data:
+
+networks:
+  blobnet:
+    name: sandbox-blobs

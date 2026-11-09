@@ -2,132 +2,115 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sandbox-api console</title>
+<title>sandbox-api v2 console</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-
 <header>
-  <div>
-    <h1># sandbox-api <span class="sub">console</span></h1>
-    <div class="crumb">one window into the platform - create, watch, exec, destroy</div>
-  </div>
-  <div id="platform" class="platform">
-    <span class="pill" id="pill-api">api ...</span>
-    <span class="pill" id="pill-dind">dind ...</span>
-    <span class="pill" id="pill-count">sandboxes ...</span>
+  <h1>sandbox-api <span class="v">v2</span></h1>
+  <div class="pills">
+    <span id="pill-api" class="pill">api: ?</span>
+    <span id="pill-dind" class="pill">dind: ?</span>
+    <span id="pill-node" class="pill">node: ?</span>
+    <span id="pill-informer" class="pill">informer: ?</span>
+    <span id="pill-count" class="pill neutral">sandboxes: ?</span>
+    <span id="pill-iso" class="pill neutral">isolation: ?</span>
   </div>
 </header>
 
-<!-- === HOW IT WORKS - the flow, always visible === -->
-<details id="how" class="how" open>
-  <summary> How this works - what happens when you click things</summary>
-  <div class="layers">
-    <div class="layer"> <b>You</b><small>this browser</small></div>
-    <div class="arrow">-></div>
-    <div class="layer"> <b>API</b><small>localhost:9000<br>decides &amp; records</small></div>
-    <div class="arrow">-></div>
-    <div class="layer"> <b>dind</b><small>a private Docker engine<br>just for sandboxes</small></div>
-    <div class="arrow">-></div>
-    <div class="layer"> <b>sandbox</b><small>own network +<br>containers inside dind</small></div>
+<section class="howto">
+  <div class="step"><b>1. you</b><br>REST / console / SSE</div>
+  <div class="arrow">&rarr;</div>
+  <div class="step"><b>2. api</b><br>state machine + SQLite<br>watches engine events</div>
+  <div class="arrow">&rarr;</div>
+  <div class="step"><b>3. dind</b><br>private engine, runc <i>or</i> gVisor<br>agent proxy :7799</div>
+  <div class="arrow">&rarr;</div>
+  <div class="step"><b>4. sandbox</b><br>own network, N containers,<br><b>sbx-agent as PID 1</b> in each</div>
+  <div class="note">
+    Everything at runtime (exec, sessions, files, fingerprints, GUI) goes
+    api &rarr; proxy &rarr; agent over HTTP. No <code>docker exec</code>.
+    Create = alloc port &rarr; build/pull images in dind &rarr; network &rarr;
+    containers (agent injected) &rarr; wait agents + app &rarr; READY.
+    Delete = remove containers + network, free port, keep event log.
   </div>
-  <div class="flows">
-    <div class="flow">
-      <b>When you CREATE:</b>
-      <ol>
-        <li>name checked (idempotent - same name+spec returns the old one)</li>
-        <li>a port from the pool is allocated (see the pool bar below)</li>
-        <li>images pulled/built <i>inside dind</i></li>
-        <li>a private network + the template's containers start</li>
-        <li>readiness check -> state <span class="badge READY">READY</span></li>
-      </ol>
-      <i>Every step appears live in the sandbox's event log.</i>
-    </div>
-    <div class="flow">
-      <b>When you DELETE:</b>
-      <ol>
-        <li>all its containers are force-removed</li>
-        <li>its private network is removed</li>
-        <li>its port returns to the pool</li>
-        <li>state -> <span class="badge DELETED">DELETED</span>, but the event log stays (audit trail)</li>
-      </ol>
-      <i>Deleting twice -> 404. Deleting while CREATING -> 409.</i>
-    </div>
-  </div>
-</details>
+</section>
 
-<!-- === PORT POOL - see allocation happen === -->
-<section class="poolwrap">
-  <h2>Port pool <small>one port = the sandbox's front door (localhost:&lt;port&gt;)</small></h2>
+<section>
+  <h2>Port pool <small>(identity mapping: inner P = dind P = localhost:P)</small></h2>
   <div id="pool" class="pool"></div>
 </section>
 
-<!-- === CREATE === -->
 <section class="create">
   <h2>Create a sandbox</h2>
-  <div class="templates" id="templates">
-    <label class="tcard" data-t="web">
-      <input type="radio" name="template" value="web" checked>
-      <b>web</b>
-      <div class="tdiagram"> 1 container<br><code>busybox httpd :80</code></div>
-      <small>introspection page + /health probe. Gets a port.</small>
-    </label>
-    <label class="tcard" data-t="coreapp">
-      <input type="radio" name="template" value="coreapp">
-      <b>coreapp</b>
-      <div class="tdiagram"> 3 containers<br><code>nginx -> fastapi -> postgres</code></div>
-      <small>a full working task-board app. Gets a port.</small>
-    </label>
-    <label class="tcard" data-t="blank">
-      <input type="radio" name="template" value="blank">
-      <b>blank</b>
-      <div class="tdiagram"> 1 container<br><code>alpine shell</code></div>
-      <small>nothing published - a pure exec target. No port.</small>
-    </label>
+  <div id="templates" class="templates">
+    <label class="tcard sel" data-t="web"><input type="radio" name="template" value="web" checked>
+      <b>web</b><span>busybox httpd + agent</span><small>[ web ]</small></label>
+    <label class="tcard" data-t="blank"><input type="radio" name="template" value="blank">
+      <b>blank</b><span>agent only, exec target</span><small>[ shell ]</small></label>
+    <label class="tcard" data-t="coreapp"><input type="radio" name="template" value="coreapp">
+      <b>coreapp</b><span>nginx &rarr; FastAPI &rarr; Postgres</span><small>[ frontend ] [ backend ] [ db ]</small></label>
+    <label class="tcard" data-t="desktop"><input type="radio" name="template" value="desktop">
+      <b>desktop</b><span>XFCE + Chromium + GUI API</span><small>[ desktop ]</small></label>
   </div>
-  <div class="createrow">
-    <input id="cname" placeholder="name (e.g. my-test)" spellcheck="false">
-    <input id="cttl" type="number" min="10" placeholder="TTL seconds (optional - self-destruct)">
-    <button id="create">> create</button>
+  <div class="row">
+    <input id="cname" placeholder="name (a-z0-9-), blank = random">
+    <input id="cttl" placeholder="ttl seconds (optional)" type="number" min="10">
+    <select id="ciso"><option value="container">isolation: container (runc)</option><option value="gvisor">isolation: gvisor (runsc)</option></select>
+    <button id="create">create</button>
   </div>
-  <div id="createlog" class="createlog hidden"></div>
+  <pre id="createlog" class="log hidden"></pre>
 </section>
 
-<!-- === SANDBOX LIST === -->
 <section>
-  <h2>Sandboxes <small id="refresh-note">auto-refreshing every 2s</small></h2>
-  <div id="list" class="list"></div>
-  <div id="empty" class="empty">no sandboxes yet - create one above </div>
+  <h2>Sandboxes</h2>
+  <div id="empty" class="empty">none yet - create one above</div>
+  <div id="list" class="cards"></div>
 </section>
 
-<!-- === DETAIL DRAWER === -->
-<div id="drawer" class="drawer hidden">
-  <div class="drawer-inner">
-    <button class="close" id="close">x</button>
-    <h2 id="d-title"></h2>
-    <div id="d-meta" class="dmeta"></div>
+<section>
+  <h2>Live events <small>(server-sent events, /events)</small></h2>
+  <pre id="livelog" class="log small"></pre>
+</section>
 
-    <h3> What's inside <small>live from the engine</small></h3>
-    <table class="ctable"><thead>
-      <tr><th>container</th><th>role</th><th>image</th><th>status</th><th>health</th></tr>
-    </thead><tbody id="d-containers"></tbody></table>
+<aside id="drawer" class="drawer hidden">
+  <button id="close" class="ghost close">x</button>
+  <h2 id="d-title">...</h2>
+  <div id="d-meta" class="meta"></div>
 
-    <h3> Run a command inside</h3>
-    <div class="execbox">
-      <select id="exec-container"></select>
-      <input id="exec-cmd" placeholder='e.g.  hostname ;  ip addr ;  ps aux ;  cat /etc/os-release' spellcheck="false">
-      <input id="exec-timeout" type="number" min="1" max="300" value="30" title="timeout seconds">
-      <button id="exec-run">run</button>
-    </div>
-    <pre id="exec-out" class="execout hidden"></pre>
+  <h3>What's inside</h3>
+  <table><thead><tr><th>container</th><th>role</th><th>status</th><th>health</th><th>ip</th><th>runtime</th></tr></thead>
+  <tbody id="d-containers"></tbody></table>
 
-    <h3> Event timeline <small>what the platform did, in order</small></h3>
-    <div id="d-events" class="events"></div>
+  <h3>Run a command (one-shot exec through the agent)</h3>
+  <div class="row">
+    <select id="exec-container"></select>
+    <input id="exec-cmd" placeholder="hostname" value="hostname">
+    <input id="exec-timeout" type="number" value="30" min="1" max="300" title="timeout s">
+    <button id="exec-run">run</button>
   </div>
-</div>
+  <pre id="exec-out" class="log hidden"></pre>
 
-<div id="toasts"></div>
+  <h3>Durable terminal (session with pty, resumable)</h3>
+  <div class="row">
+    <button id="term-open">open shell</button>
+    <input id="term-in" placeholder="type a line, Enter sends it to stdin" disabled>
+    <button id="term-kill" class="danger" disabled>kill</button>
+  </div>
+  <pre id="term-out" class="log hidden"></pre>
+
+  <h3>Files</h3>
+  <div class="row">
+    <input id="fs-path" placeholder="/www" value="/">
+    <button id="fs-list">list</button>
+    <button id="fs-fp">fingerprint</button>
+  </div>
+  <pre id="fs-out" class="log hidden"></pre>
+
+  <h3>Event timeline</h3>
+  <div id="d-events" class="events"></div>
+</aside>
+
+<div id="toasts" class="toasts"></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

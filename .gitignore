@@ -1,0 +1,4 @@
+# scratch/test artifacts and Python bytecode
+.tmp/
+__pycache__/
+*.pyc

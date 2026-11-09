@@ -1,0 +1,44 @@
+# ============================================================================
+#  sandbox-egress - per-sandbox network policy, record/replay, zero-secret
+#
+#  Enforcement is INSIDE sandbox-api (proxy container + iptables fence per
+#  sandbox, options.egress) and the proxy addon (proxy/addon.py, built
+#  inside dind). This service is the cassette catalogue + blob shipping +
+#  convenience passthroughs.
+#
+#    you -> egress :9410 -> sandbox-api (api:8000) / sandbox-blobs (blobs:8000)
+#
+#  PREREQUISITES: ../sandbox-api and ../sandbox-blobs up.
+# ============================================================================
+name: sandbox-egress
+
+services:
+  egress:
+    build:
+      context: ./service
+    image: sandbox-egress:local
+    environment:
+      SANDBOX_API_URL: ${SANDBOX_API_URL:-http://api:8000}
+      BLOBS_URL: ${BLOBS_URL:-http://blobs:8000}
+      DB_PATH: /data/egress.db
+    volumes:
+      - egress-data:/data
+    ports:
+      - "${EGRESS_PORT:-9410}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [sandnet, blobnet]
+
+volumes:
+  egress-data:
+
+networks:
+  sandnet:
+    name: sandbox-api_sandnet
+    external: true
+  blobnet:
+    name: sandbox-blobs
+    external: true

@@ -115,3 +115,6 @@ section, .how { margin: 1.2rem auto; max-width: 1150px; padding: 0 1.5rem; }
 .toast { background: #132033; border: 1px solid #fbbf24; border-radius: 10px; padding: .6rem 1rem; font-size: .82rem; max-width: 380px; animation: slidein .2s ease-out; }
 .toast.err { border-color: #ef4444; }
 @keyframes slidein { from { transform: translateX(30px); opacity: 0; } }
+
+.badge.PREEMPTED { background:#fb923c; color:#431407; }
+.badge.PREEMPTING { background:#fbbf24; color:#422006; animation:pulse 1s infinite; }

@@ -1,14 +1,18 @@
 /* ============================================================================
- * sandbox-api console - a dependency-free SPA.
+ * sandbox-api v2 console - a dependency-free SPA.
  *
  * Mental model (mirrors the backend):
- *   GET  /status                      -> header pills + pool bar
- *   GET  /sandboxes                   -> the cards
- *   GET  /sandboxes/{id}/containers   -> "what's inside" (drawer)
- *   GET  /sandboxes/{id}/events       -> timeline (drawer + create log)
- *   POST /sandboxes/{id}/exec         -> run commands from the browser
+ *   GET  /status                       -> header pills + pool bar
+ *   GET  /sandboxes                    -> the cards
+ *   GET  /sandboxes/{id}/containers    -> "what's inside" (drawer)
+ *   GET  /sandboxes/{id}/events        -> timeline (drawer + create log)
+ *   GET  /events (SSE)                 -> the live log at the bottom
+ *   POST /sandboxes/{id}/exec          -> run commands (agent)
+ *   POST /sandboxes/{id}/sessions ...  -> durable terminal (agent)
+ *   GET  /sandboxes/{id}/fs            -> file listing (agent)
+ *   GET  /sandboxes/{id}/fingerprint   -> merkle root (agent)
  *
- * Everything polls every 2s so you WATCH things happen instead of guessing.
+ * Cards/status poll every 2 s; events arrive live over SSE.
  * ==========================================================================*/
 
 const $ = (id) => document.getElementById(id);
@@ -16,15 +20,16 @@ const api = async (path, opts = {}) => {
   const r = await fetch(path, opts);
   if (r.status === 204) return null;
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw { status: r.status, detail: body.detail || r.statusText };
+  if (!r.ok) throw { status: r.status, detail: body.detail || body.error || r.statusText };
   return body;
 };
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
-let selectedId = null;          // which sandbox the drawer shows
-let creatingId = null;          // sandbox whose creation we're narrating
-let lastEventSeq = {};          // sandboxId -> last seq rendered (create log)
+let selectedId = null;
+let creatingId = null;
+let lastEventSeq = {};
+let term = { session: null, since: 0, timer: null };
 
-/* -- toasts: small explanations of what just happened -----------------------*/
 function toast(msg, isErr = false) {
   const el = document.createElement("div");
   el.className = "toast" + (isErr ? " err" : "");
@@ -39,8 +44,10 @@ async function refreshStatus() {
     const s = await api("/status");
     setPill("pill-api", `api: ${s.api}`, s.api === "up");
     setPill("pill-dind", `dind: ${s.dind}`, s.dind === "up");
-    $("pill-count").textContent =
-      `sandboxes: ${s.sandboxes}/${s.max_sandboxes}`;
+    setPill("pill-node", `node: ${s.node}`, s.node === "up");
+    setPill("pill-informer", `informer: ${s.informer.connected ? "watching" : "down"} (${s.informer.events_seen} ev)`, s.informer.connected);
+    $("pill-count").textContent = `sandboxes: ${s.sandboxes}/${s.max_sandboxes}`;
+    $("pill-iso").textContent = `isolation: ${s.isolation_available.join(", ")}`;
     renderPool(s.pool);
   } catch {
     setPill("pill-api", "api: unreachable", false);
@@ -58,7 +65,6 @@ function renderPool(pool) {
     const cell = document.createElement("div");
     cell.className = "cell" + (used.has(p) ? " used" : "");
     cell.textContent = p;
-    cell.title = used.has(p) ? `port ${p}: in use` : `port ${p}: free`;
     $("pool").appendChild(cell);
   }
 }
@@ -75,23 +81,27 @@ async function refreshSandboxes() {
 function card(s) {
   const el = document.createElement("div");
   el.className = "card";
-  const urlBtn = s.url && s.state === "READY"
-    ? `<a href="${s.url}" target="_blank"><button>open app </button></a>` : "";
-  const stopStart = s.state === "READY"
-    ? `<button class="ghost" data-act="stop">stop</button>`
-    : s.state === "STOPPED"
-      ? `<button class="ghost" data-act="start">start</button>` : "";
-  const ttl = s.ttl_seconds ? ` .  ttl ${s.ttl_seconds}s` : "";
+  const live = s.state === "READY" || s.state === "DEGRADED";
+  const urlBtn = s.url && live
+    ? `<a href="${s.url}" target="_blank"><button>open app</button></a>` : "";
+  const stopStart = live
+    ? `<button class="ghost" data-act="stop">stop</button>` +
+      (s.state === "DEGRADED" ? `<button class="ghost" data-act="start">heal</button>` : "")
+    : s.state === "STOPPED" ? `<button class="ghost" data-act="start">start</button>` : "";
+  const ttl = s.ttl_seconds ? ` . ttl ${s.ttl_seconds}s` : "";
+  const dead = s.detail && s.detail.dead ? Object.entries(s.detail.dead).map(([k, v]) => `${k} ${v}`).join(", ") : "";
   el.innerHTML = `
-    <h3>${s.name} <span class="badge ${s.state}">${s.state}</span></h3>
+    <h3>${esc(s.name)} <span class="badge ${s.state}">${s.state}</span>
+      <span class="iso ${s.isolation}">${s.isolation}</span></h3>
     <div class="meta">
       template <code>${s.template}</code> . id <code>${s.id}</code>
       ${s.port ? ` . port <code>${s.port}</code>` : " . no port"}${ttl}
-      ${s.error ? `<div style="color:#fca5a5">[!] ${s.error}</div>` : ""}
+      ${s.error ? `<div class="err">[!] ${esc(s.error)}</div>` : ""}
+      ${dead ? `<div class="err">dead: ${esc(dead)}</div>` : ""}
     </div>
     <div class="actions">
       ${urlBtn}
-      <button class="ghost" data-act="details">details ></button>
+      <button class="ghost" data-act="details">details &gt;</button>
       ${stopStart}
       <button class="danger" data-act="delete">delete</button>
     </div>`;
@@ -104,19 +114,19 @@ async function act(s, action) {
   try {
     if (action === "details") return openDrawer(s);
     if (action === "delete") {
-      if (!confirm(`Delete ${s.name}?\n\nThis removes its containers + network, frees its port, and keeps the event log.`)) return;
+      if (!confirm(`Delete ${s.name}?\n\nRemoves containers + network, frees the port, keeps the event log.`)) return;
       await api(`/sandboxes/${s.id}`, { method: "DELETE" });
-      toast(` <b>${s.name}</b> deleted - containers & network removed, port ${s.port ?? " - "} freed.`);
+      toast(`<b>${esc(s.name)}</b> deleted.`);
     } else if (action === "stop") {
       await api(`/sandboxes/${s.id}/stop`, { method: "POST" });
-      toast(` <b>${s.name}</b> stopped - containers frozen, port still reserved.`);
+      toast(`<b>${esc(s.name)}</b> stopped - containers frozen, port still reserved.`);
     } else if (action === "start") {
       await api(`/sandboxes/${s.id}/start`, { method: "POST" });
-      toast(`> <b>${s.name}</b> started.`);
+      toast(`<b>${esc(s.name)}</b> started.`);
     }
     refreshSandboxes();
   } catch (e) {
-    toast(`[!] ${action} failed: HTTP ${e.status} - ${e.detail}`, true);
+    toast(`[!] ${action} failed: HTTP ${e.status} - ${esc(e.detail)}`, true);
   }
 }
 
@@ -128,29 +138,27 @@ $("templates").addEventListener("click", (e) => {
   card.classList.add("sel");
   card.querySelector("input").checked = true;
 });
-document.querySelector('.tcard[data-t="web"]').classList.add("sel");
 
 $("create").addEventListener("click", async () => {
-  const name = $("cname").value.trim() ||
-    `sb-${Math.random().toString(16).slice(2, 6)}`;
+  const name = $("cname").value.trim() || `sb-${Math.random().toString(16).slice(2, 6)}`;
   const template = document.querySelector('input[name="template"]:checked').value;
   const ttl = parseInt($("cttl").value) || null;
+  const isolation = $("ciso").value;
   const log = $("createlog");
   log.classList.remove("hidden");
   log.innerHTML = "";
-  narrate(`> POST /sandboxes {name:"${name}", template:"${template}"${ttl ? `, ttl:${ttl}` : ""}}`);
+  narrate(`> POST /sandboxes {name:"${name}", template:"${template}", isolation:"${isolation}"${ttl ? `, ttl:${ttl}` : ""}}`);
   try {
     const s = await api("/sandboxes", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name, template, ttl_seconds: ttl }),
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, template, ttl_seconds: ttl, isolation }),
     });
     creatingId = s.id;
     lastEventSeq[s.id] = 0;
-    narrate(`[ok] accepted: id=${s.id}, state=CREATING - now watch its event log:`);
+    narrate(`[ok] accepted: id=${s.id}, state=${s.state} - watching its event log:`);
   } catch (e) {
     narrate(`x HTTP ${e.status}: ${e.detail}`);
-    toast(`[!] create failed: ${e.detail}`, true);
+    toast(`[!] create failed: ${esc(e.detail)}`, true);
   }
 });
 
@@ -162,9 +170,6 @@ function narrate(line) {
   log.scrollTop = log.scrollHeight;
 }
 
-/* While creating, stream the new sandbox's events into the create log  - 
- * the user literally watches: port allocated -> image built -> containers
- * started -> READY. */
 async function pumpCreateLog() {
   if (!creatingId) return;
   try {
@@ -185,68 +190,72 @@ async function pumpCreateLog() {
       narrate(`x FAILED - ${s.error}`);
       creatingId = null;
     }
-  } catch { /* sandbox may not exist yet; next tick retries */ }
+  } catch { /* next tick retries */ }
 }
 
-/* -- drawer: what's inside + exec + timeline -------------------------------*/
+/* -- live SSE log -----------------------------------------------------------*/
+function startLive() {
+  const log = $("livelog");
+  const es = new EventSource("/events?cursor=0&follow=1&timeout=3600&limit=30");
+  es.onmessage = (m) => {
+    const e = JSON.parse(m.data);
+    const line = `${new Date(e.ts * 1000).toLocaleTimeString()}  ${e.sandbox_id}  #${e.seq} [${e.type}] ${e.message}`;
+    const div = document.createElement("div");
+    div.textContent = line;
+    log.appendChild(div);
+    while (log.children.length > 200) log.removeChild(log.firstChild);
+    log.scrollTop = log.scrollHeight;
+  };
+  es.addEventListener("end", () => { es.close(); setTimeout(startLive, 1000); });
+  es.onerror = () => { es.close(); setTimeout(startLive, 3000); };
+}
+
+/* -- drawer -----------------------------------------------------------------*/
 async function openDrawer(s) {
   selectedId = s.id;
   $("drawer").classList.remove("hidden");
+  stopTerm();
   await refreshDrawer();
 }
 $("close").addEventListener("click", () => {
   selectedId = null;
+  stopTerm();
   $("drawer").classList.add("hidden");
 });
 
 async function refreshDrawer() {
   if (!selectedId) return;
   let s;
-  try { s = await api(`/sandboxes/${selectedId}`); }
-  catch { return; }                       // deleted under us; next tick closes
-  $("d-title").innerHTML =
-    `${s.name} <span class="badge ${s.state}">${s.state}</span>`;
+  try { s = await api(`/sandboxes/${selectedId}`); } catch { return; }
+  $("d-title").innerHTML = `${esc(s.name)} <span class="badge ${s.state}">${s.state}</span>`;
   $("d-meta").innerHTML =
-    `id <code>${s.id}</code> . template <code>${s.template}</code>` +
-    (s.url ? ` . <a href="${s.url}" target="_blank" style="color:#38bdf8">${s.url}</a>` : "") +
-    (s.error ? ` . <span style="color:#fca5a5">${s.error}</span>` : "");
-
-  // containers (what's inside)
+    `id <code>${s.id}</code> . template <code>${s.template}</code> . isolation <code>${s.isolation}</code>` +
+    (s.url ? ` . <a href="${s.url}" target="_blank">${s.url}</a>` : "") +
+    (s.error ? ` . <span class="err">${esc(s.error)}</span>` : "");
   try {
     const cs = await api(`/sandboxes/${selectedId}/containers`);
     $("d-containers").innerHTML = cs.map(c => `
-      <tr>
-        <td><code>${c.name}</code></td>
-        <td><span class="role">${c.role}</span></td>
-        <td>${c.image}</td>
-        <td class="st-${c.status}">${c.status}</td>
-        <td>${c.health ?? " - "}</td>
-      </tr>`).join("");
-    // keep the exec container picker in sync
+      <tr><td><code>${c.name}</code></td><td><span class="role">${c.role}</span></td>
+      <td class="st-${c.status}">${c.status}</td><td>${c.health ?? "-"}</td>
+      <td>${c.ip ?? "-"}</td><td>${c.runtime ?? "-"}</td></tr>`).join("");
     const sel = $("exec-container");
     const prev = sel.value;
-    sel.innerHTML = cs.filter(c => c.status === "running")
-      .map(c => `<option>${c.name}</option>`).join("");
+    sel.innerHTML = `<option value="">(template default)</option>` +
+      cs.filter(c => c.status === "running").map(c => `<option>${c.name}</option>`).join("");
     if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
   } catch (e) {
-    $("d-containers").innerHTML =
-      `<tr><td colspan="5">engine error: ${e.detail}</td></tr>`;
+    $("d-containers").innerHTML = `<tr><td colspan="6">engine error: ${esc(e.detail)}</td></tr>`;
   }
-
-  // events (timeline)
   try {
     const ev = await api(`/sandboxes/${selectedId}/events`);
     $("d-events").innerHTML = ev.map(e => `
-      <div class="event">
-        <span class="seq">${e.seq}</span>
-        <span class="type t-${e.type}">${e.type}</span>
-        <span>${e.message}</span>
-        <time>${new Date(e.ts * 1000).toLocaleTimeString()}</time>
-      </div>`).join("");
+      <div class="event"><span class="seq">${e.seq}</span>
+        <span class="type t-${e.type}">${e.type}</span><span>${esc(e.message)}</span>
+        <time>${new Date(e.ts * 1000).toLocaleTimeString()}</time></div>`).join("");
   } catch { /* tolerate */ }
 }
 
-/* -- exec from the browser -------------------------------------------------*/
+/* -- exec -------------------------------------------------------------------*/
 $("exec-run").addEventListener("click", async () => {
   if (!selectedId) return;
   const cmdText = $("exec-cmd").value.trim() || "hostname";
@@ -254,32 +263,99 @@ $("exec-run").addEventListener("click", async () => {
   const timeout = parseInt($("exec-timeout").value) || 30;
   const out = $("exec-out");
   out.classList.remove("hidden");
-  out.textContent = `$ ${cmdText}\n(running in ${container ?? "app container"}...)`;
+  out.textContent = `$ ${cmdText}\n(running...)`;
   try {
     const r = await api(`/sandboxes/${selectedId}/exec`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      // the console always wraps your text in sh -c so pipes/; just work
+      method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ cmd: ["sh", "-c", cmdText], timeout, container }),
     });
-    const flags = [
-      r.exit_code !== null ? `exit=${r.exit_code}` : "exit=?",
-      r.timed_out ? "TIMED OUT" : null,
-      r.truncated ? "TRUNCATED at 64KiB" : null,
-    ].filter(Boolean).join(" . ");
-    out.innerHTML =
-      `<span class="meta">$ ${cmdText}   [${flags}]   in ${r.container}</span>\n` +
-      `${r.stdout ? escapeHtml(r.stdout) : ""}` +
-      (r.stderr ? `<span class="stderr">${escapeHtml(r.stderr)}</span>` : "");
+    const flags = [r.exit_code !== null ? `exit=${r.exit_code}` : "exit=?",
+      r.timed_out ? "TIMED OUT (killed)" : null, r.truncated ? "TRUNCATED" : null].filter(Boolean).join(" . ");
+    out.innerHTML = `<span class="meta">$ ${esc(cmdText)}   [${flags}]   in ${r.container}  session ${r.session_id}</span>\n` +
+      esc(r.stdout || "") + (r.stderr ? `<span class="stderr">${esc(r.stderr)}</span>` : "");
   } catch (e) {
     out.textContent = `x HTTP ${e.status}: ${e.detail}`;
   }
 });
-function escapeHtml(s) {
-  return s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+$("exec-cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") $("exec-run").click(); });
+
+/* -- durable terminal (session + pty + resumable stream) --------------------*/
+$("term-open").addEventListener("click", async () => {
+  if (!selectedId) return;
+  const container = $("exec-container").value || null;
+  try {
+    const s = await api(`/sandboxes/${selectedId}/sessions`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ cmd: ["sh"], tty: true, cols: 100, rows: 30, container }),
+    });
+    term = { session: s.id, since: 0, timer: null };
+    $("term-out").classList.remove("hidden");
+    $("term-out").textContent = `[session ${s.id} pid ${s.pid}]\n`;
+    $("term-in").disabled = false; $("term-kill").disabled = false;
+    $("term-in").focus();
+    pumpTerm();
+  } catch (e) { toast(`[!] session failed: ${esc(e.detail)}`, true); }
+});
+async function pumpTerm() {
+  if (!term.session) return;
+  try {
+    const r = await fetch(`/sandboxes/${selectedId}/sessions/${term.session}/stream?since=${term.since}&follow=1&timeout=20`);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const f = JSON.parse(line);
+        if (f.seq) term.since = f.seq;
+        if (f.d) $("term-out").textContent += atob(f.d);
+        if (f.s === "x") { $("term-out").textContent += `\n[exited ${f.code}]`; stopTerm(); return; }
+        $("term-out").scrollTop = $("term-out").scrollHeight;
+      }
+    }
+    if (term.session) term.timer = setTimeout(pumpTerm, 100);  // re-attach with since=
+  } catch { if (term.session) term.timer = setTimeout(pumpTerm, 1000); }
 }
-$("exec-cmd").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") $("exec-run").click();
+$("term-in").addEventListener("keydown", async (e) => {
+  if (e.key !== "Enter" || !term.session) return;
+  const line = $("term-in").value + "\n";
+  $("term-in").value = "";
+  await fetch(`/sandboxes/${selectedId}/sessions/${term.session}/stdin`, { method: "POST", body: line });
+});
+$("term-kill").addEventListener("click", async () => {
+  if (!term.session) return;
+  await api(`/sandboxes/${selectedId}/sessions/${term.session}/signal`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ signal: "KILL" }) });
+});
+function stopTerm() {
+  if (term.timer) clearTimeout(term.timer);
+  term = { session: null, since: 0, timer: null };
+  $("term-in").disabled = true; $("term-kill").disabled = true;
+}
+
+/* -- files + fingerprint ----------------------------------------------------*/
+$("fs-list").addEventListener("click", async () => {
+  if (!selectedId) return;
+  const out = $("fs-out"); out.classList.remove("hidden");
+  try {
+    const r = await api(`/sandboxes/${selectedId}/fs?path=${encodeURIComponent($("fs-path").value || "/")}`);
+    out.textContent = r.entries.map(e => `${e.type.padEnd(8)} ${e.mode} ${String(e.size).padStart(9)}  ${e.name}${e.link ? " -> " + e.link : ""}`).join("\n") || "(empty)";
+  } catch (e) { out.textContent = `x HTTP ${e.status}: ${e.detail}`; }
+});
+$("fs-fp").addEventListener("click", async () => {
+  if (!selectedId) return;
+  const out = $("fs-out"); out.classList.remove("hidden");
+  out.textContent = "hashing...";
+  try {
+    const r = await api(`/sandboxes/${selectedId}/fingerprint?path=${encodeURIComponent($("fs-path").value || "/")}&detail=1`);
+    out.textContent = `root ${r.root}\n${r.files} files, ${r.dirs} dirs, ${r.bytes} bytes (in ${r.container})\n\n` +
+      r.entries.slice(0, 200).map(e => `${e.type} ${e.hash.slice(0, 12)} ${e.mode} ${e.path}`).join("\n");
+  } catch (e) { out.textContent = `x HTTP ${e.status}: ${e.detail}`; }
 });
 
 /* -- main loop --------------------------------------------------------------*/
@@ -291,3 +367,4 @@ async function tick() {
 }
 tick();
 setInterval(tick, 2000);
+startLive();

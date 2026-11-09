@@ -1,97 +1,82 @@
-# sandbox-scheduler - Implementation Notes
+# sandbox-scheduler v2 - Implementation Notes
 
 ## Files
 
 ```
 sandbox-scheduler/
-+-- docker-compose.yml        one service (scheduler), host-gateway mapping
-+-- .env.example              every knob: capacity, caps, aging, cadences
++-- docker-compose.yml        one service; SANDBOX_API_URL, CHECKPOINT_URL, PREEMPT_*, MEMORY_* knobs
++-- .env.example              every knob documented
 +-- scheduler/
 |   +-- Dockerfile            python:3.12-slim + fastapi/uvicorn/requests
-|   +-- requirements.txt
 |   +-- app/
-|       +-- config.py         env-driven config + TEMPLATE_COST + state sets
-|       +-- store.py          SQLite jobs/events, idempotency keys, metrics queries
-|       +-- upstream.py       sandbox-api client; UpstreamDown / UpstreamConflict
-|       +-- scheduler.py      the core: 4 loops, admission, aging, reconcile
-|       +-- main.py           FastAPI routes + console mount
-|       +-- static/           console SPA (index.html, style.css, app.js)
-+-- scripts/  start/stop/reset.ps1, demo.ps1, verify.sh
-+-- docs/     ARCHITECTURE, EDGE-CASES, EXAMPLES, SECURITY, this file
+|       +-- clock.py          injectable clock (virtual in the simulator)
+|       +-- config.py         capacity, aging, preemption, memory budget, cadences, TEMPLATE_COST
+|       +-- store.py          SQLite (class-based): jobs with v2 columns, events, counters
+|       +-- upstream.py       sandbox-api client + checkpoint client (create/fork), memory sampling
+|       +-- core.py           THE policy: placer/monitor/janitor/cancel ticks, provision + preempt generators,
+|                             submit, cancel, reconcile - no threads, no HTTP, no clock
+|       +-- main.py           routes + loops + worker threads driving the core
+|       +-- static/           console (queue with deadlines/states, jobs with v2 facts)
++-- scripts/  start/stop/reset.ps1, demo.ps1, verify.sh (v1 16 sections + v2 17-20)
++-- docs/     ARCHITECTURE . EDGE-CASES . EXAMPLES . SECURITY . this file
 ```
 
-### scheduler.py - the core, piece by piece
+The scheduler is also imported by `../sandbox-sim/sim/sched.py` (as
+`sched_app`) and fuzzed against the sandbox-api core.
 
-- **`_admission` lock** - every admission decision happens inside it. The
-  herd test proves N concurrent submits cannot oversubscribe.
-- **`_engine_view()`** - one upstream `/status` + `/sandboxes` call per
-  placer tick gives engine truth: total sandboxes (slots), mine vs
-  unmanaged, free ports. Scheduler-owned sandboxes are name-correlated
-  (`sched-*`).
-- **`_fits()`** - all three budgets (cpu units, slots, ports for
-  port-needing templates) plus the per-tenant cap.
-- **`_select_next()`** - WFQ across tenants (least-served first), then
-  within the tenant: effective-priority order with skip-and-fill.
-- **`effective_priority()`** - base + `min(cap, age // interval)`, computed
-  from a monotonic anchor so wall-clock jumps can't game it.
-- **`_admit()` / `_provision()`** - admission writes state first (the
-  reservation), provisioning happens on a thread. Upstream 429 mid-gang ->
-  rollback all created sandboxes, FAILED. UpstreamDown mid-create ->
-  **requeue** to QUEUED (admission was cheap; redo it later).
-- **`monitor_loop`** - ADMITTED -> RUNNING when all gang members are READY;
-  spawns the task executor; notices vanished sandboxes under RUNNING
-  service jobs.
-- **`_run_task()`** - execs the command in each sandbox, stores per-member
-  results, releases sandboxes, SUCCEEDED iff all exit 0.
-- **`janitor_loop`** - expiry via monotonic deadlines; orphan sweep for any
-  `sched-*` sandbox without a live job.
-- **`cancel_loop`** - the only safe teardown: delete with retry until the
-  engine confirms absence, then CANCELLED.
-- **`reconcile()`** - on boot, re-anchor monotonic clocks from wall-clock
-  timestamps for every live job. The loops do the rest (self-stabilizing).
+## The v2 refactor
 
-## Bugs found while building (all fixed, all covered by verify.sh)
+v1 was `scheduler.py`: four `while True` loops, module-level store and
+upstream, `time.*` everywhere, threads spawned from inside the policy.
+v2 splits it exactly like sandbox-api:
 
-1. **Test-side: invalid names.** `aged-B`/`newer-C` failed the name
-   validator (uppercase) and `count: 9` exceeded `le: 8` - the tests saw
-   empty job ids. Fixed the tests (lowercase names, count 5). The API
-   validators did exactly their job.
-2. **Queue-bound test was racy.** A fast-draining queue rarely hits 50
-   deep, so 429s were nondeterministic. Fix: fill the cluster with blocker
-   jobs first, then submit 55 - now exactly 5 get 429 every run.
-3. **`grep -c` counts lines, not matches** - the single-line JSON from
-   `/jobs` made the fairness assertion always 1. Fixed with `grep -o | wc -l`.
-4. **`set -u` vs uninitialized counter** in verify.sh (`N429`). Initialize
-   before the loop.
-5. **Cancel loop's terminal check was convoluted** (double condition).
-   Rewrote as: attempt deletes, re-list, CANCELLED only when truly gone -
-   simpler and correct.
+- `core.py` holds every decision and transition; each loop body is one
+  method (`placer_tick`, `monitor_tick`, `janitor_tick`, `cancel_tick`);
+  long operations are generators (`provision_steps`, `preempt_steps`).
+- `main.py` owns threads and HTTP; it never decides anything.
+- `clock.py` and `Store(db_path)` make time and storage injectable.
+- `upstream.py` is a class with `Down`/`Conflict` exception attributes so
+  the simulator can substitute an adapter with the same contract.
 
-## Design decisions worth knowing
+## New behaviour, where it lives
 
-- **Why the scheduler doesn't talk to docker directly.** Keeping the docker
-  boundary inside sandbox-api means exactly one component owns engine
-  semantics (labels, reconciliation, exec quirks). The scheduler is pure
-  policy - and replaceable.
-- **Why requeue on upstream outage instead of failing.** Admission is a
-  promise about the future; a transient outage shouldn't kill queued work.
-  Jobs that DID partially create roll back first, so the requeue is clean.
-- **Why monotonic + wall dual timestamps.** Monotonic is right for intervals
-  but per-process; wall survives restarts. Store both; re-derive on boot.
-  (This closes the "TTL slides on restart" limitation documented in T01.)
-- **Why name correlation (`sched-<jobid>-<k>`).** After any crash, the
-  engine alone tells the truth about what exists. Names are the join key -
-  no extra shared state to keep consistent.
+| Feature | Code |
+|---|---|
+| EDF | `select_next` sort key `(-effective_priority, deadline_at, created_at)`; `_finish` counts misses |
+| preemption | `placer_tick` -> `select_next` returns the best job blocked on CPU -> `choose_victims` -> `PREEMPTING`; `preempt_steps` checkpoints via `upstream.checkpoint_create`, deletes, sets PREEMPTED (+resume bonus in `effective_priority`); `provision_steps` forks when `checkpoint_id` is set |
+| memory budget | `monitor_tick` samples `upstream.sandbox_memory` (agent cgroup stats) into `mem_bytes`; `_fits` compares observed + estimate with `engine_view()["memory_budget"]` |
+| crash recovery | `reconcile`: re-anchor clocks, PREEMPTING -> RUNNING, **ADMITTED -> re-queued** |
 
-## Verified end to end
+## Bugs found while building
 
-- [x] `bash scripts/verify.sh` - **41/41**: health, task success/failure +
-  output capture, idempotency (replay + conflict), queue bound (5x 429),
-  50-job herd drain with concurrency never > 4 and zero leaks, tenant
-  fairness, skip-and-fill, aging (aged job beat newer higher-priority job),
-  cancel from every state + 409 on terminal, 30x cancel race with zero
-  leaks, gang all-or-nothing, max_runtime expiry with teardown, downstream
-  outage + recovery, scheduler restart with re-adoption + orphan reaping,
-  metrics + prometheus exposition.
-- [x] Console: submit / herd / fairness buttons, live queue aging, drawer
-  with sandboxes + result + events - all live-polled.
+1. **(simulator) ADMITTED forever.** A job whose provision thread died
+   with the process stayed ADMITTED with no sandboxes; v1's "the monitor
+   re-derives truth by name" only helps when something was created.
+   `reconcile()` now re-queues ADMITTED jobs (sandbox-api's idempotent
+   create adopts any sandbox that did get created under the same name).
+2. **(simulator) Preemption never triggered.** The candidate was the
+   first non-fitting job of the *least-served tenant*, so a priority-9 job
+   elsewhere never counted. Now the candidate is the highest effective
+   priority job blocked specifically on CPU across all under-cap tenants.
+3. **(simulator harness) Cancel stuck on an orphaned CREATING sandbox.**
+   An API crash while the engine was down left a sandbox CREATING;
+   sandbox-api's periodic resync (which rolls it back) was not being run
+   inside the scheduler simulation's quiescence loop, so `cancel_tick`
+   retried a 409 forever. The harness now runs the api resync in the
+   loop, mirroring production.
+4. **(simulator harness) Queue bound after a crash.** Re-queued ADMITTED
+   jobs can push the depth past `MAX_QUEUE`; the invariant now allows
+   the in-flight admission count on top of the bound (and the behaviour
+   is documented as intended: dropping work is worse than a transient
+   overshoot of the submit bound).
+
+## Verified
+
+- [x] simulator: `python -m sim.run_sched --seeds 150 --steps 300` ->
+      0 failing seeds (4430 submits, 827 scheduler crashes); `pytest
+      tests/test_sched.py` covers preemption, non-preemption of
+      non-stateful jobs, EDF, deadline misses, checkpoint-service outage,
+      crash during preemption.
+- [x] `bash scripts/verify.sh` - see the RESULT line of the latest run
+      (v1 sections + EDF ordering, deadline-miss metric, live preemption
+      with resume by fork, memory-budget refusal).

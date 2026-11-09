@@ -1,117 +1,105 @@
-# sandbox-scheduler - T02: Concurrent Sandbox Scheduler
+# sandbox-scheduler v2 - T02: Concurrent Sandbox Scheduler with preemption
 
 > A queue + placement engine on top of the T01 sandbox-api. Submit many
 > sandbox jobs at once; the scheduler **admits what fits, queues the rest
-> fairly, ages them so nothing starves, and reaps what misbehaves** -
-> all under hard capacity limits, all recoverable after a crash.
+> fairly, ages them so nothing starves, meets deadlines first, preempts
+> low-priority stateful services for urgent work (checkpoint, evict,
+> resume by fork), and refuses admission when memory would run out** -
+> all under hard capacity limits, all recoverable after a crash, and all
+> of it **simulation-tested** against the sandbox-api core without Docker.
 
 ```
-you --> scheduler :9010  (queue, fair admission, aging, janitor)
-            |
-            | HTTP
-            v
-        sandbox-api :9000 (T01 - owns the docker engine)
-            |
+you --> scheduler :9010  (queue, fair admission, aging, EDF, preemption, janitor)
+            |  HTTP                 |  HTTP (preemption only)
+            v                       v
+        sandbox-api :9000       sandbox-checkpoint :9040
+            |                       (checkpoint victim, fork to resume)
             v
           dind --> the actual sandboxes
 ```
 
-The scheduler owns **no docker engine**. It is a pure control plane: it
-decides *which* sandbox requests get created *when*, and the sandbox-api
-decides *how*. That separation is the point of the exercise.
+The scheduler owns **no docker engine**: it is pure policy. That is what
+made it simulable - the same `core.py` runs in `../sandbox-sim` against the
+sandbox-api core with a virtual clock (`sim/sched.py`).
 
 ## Quick start (Windows)
 
 ```powershell
-# 1. PREREQUISITE - the sandbox-api stack must be running:
-cd ..\sandbox-api
-powershell -ExecutionPolicy Bypass -File scripts\start.ps1
-
-# 2. start the scheduler:
-cd ..\sandbox-scheduler
-powershell -ExecutionPolicy Bypass -File scripts\start.ps1
+cd ..\sandbox-api;        powershell -ExecutionPolicy Bypass -File scripts\start.ps1
+cd ..\sandbox-blobs;      powershell -ExecutionPolicy Bypass -File scripts\start.ps1   # for checkpoints
+cd ..\sandbox-checkpoint; powershell -ExecutionPolicy Bypass -File scripts\start.ps1   # for preemption
+cd ..\sandbox-scheduler;  powershell -ExecutionPolicy Bypass -File scripts\start.ps1
 ```
 
-Then open the console:
+Console: http://localhost:9010 (capacity bars, the queue with live aging,
+jobs table, submit form, herd/fairness buttons). API docs at `/docs`.
 
-### http://localhost:9010
+```
+bash scripts/verify.sh        # v1 battery (16 sections) + v2 sections 17-20
+```
 
-The console shows, live (2 s refresh):
-- **capacity bars** - cpu units / sandbox slots / free app ports
-- **the queue** - queued jobs with their *effective priority* and the
-  **aging bonus ticking up in front of you**
-- **the jobs table** - every job's state, wait time, sandboxes
-- **submit form** - tenant, template, kind, priority, gang count, runtime
-- **herd x12 / fairness demo buttons** - one click load tests
-- **metrics** - wait p50/p95/p99, throughput, upstream health
-
-## The two kinds of jobs
-
-| kind | lifecycle | use |
-|---|---|---|
-| `task` | sandbox created, `cmd` runs inside, result captured, sandbox deleted | batch work, CI-style runs |
-| `service` | sandbox created and kept until cancel/max_runtime | preview envs, long-running apps |
-
-## All functions (API)
-
-| Method | Path | What it does |
-|---|---|---|
-| GET | `/healthz` | scheduler + upstream liveness |
-| GET | `/status` | capacity, queue depth, per-tenant usage |
-| POST | `/jobs` | submit (202; `Idempotency-Key` header for safe retries) |
-| GET | `/jobs` | live jobs + recent terminal ones (sandboxes joined) |
-| GET | `/jobs/{id}` | one job incl. task result |
-| POST | `/jobs/{id}/cancel` | QUEUED -> CANCELLED; RUNNING -> torn down; terminal -> 409 |
-| GET | `/jobs/{id}/events` | ordered per-job event log |
-| GET | `/queue` | live queue sorted by effective priority |
-| GET | `/metrics` | JSON: wait p50/p95/p99, throughput, state counts |
-| GET | `/metrics/prometheus` | Prometheus text exposition |
-| POST | `/admin/reset` | wipe job DB (demo/testing) |
-
-### Job fields
+## Job fields
 
 ```json
 {
-  "tenant": "alice",        // fairness unit + noisy-neighbor cap (default 3)
-  "template": "blank",      // blank | web | coreapp (sandbox-api templates)
-  "kind": "task",           // task | service
-  "cmd": ["sh","-c","..."], // required for kind=task
-  "priority": 3,            // 0..9, effective = base + aging bonus
-  "count": 1,               // gang size - all-or-nothing admission
-  "cpu_units": 1,           // abstract capacity units (template default)
-  "max_runtime": 60         // seconds; null = live until cancelled
+  "tenant": "alice",            // fairness unit + noisy-neighbour cap (default 3)
+  "template": "blank",          // blank | web | coreapp
+  "kind": "task",               // task (runs cmd, then releases) | service (lives until cancel/max_runtime)
+  "cmd": ["sh","-c","..."],     // required for kind=task
+  "priority": 3,                // 0..9; effective = base + aging (+ resume bonus)
+  "count": 1,                   // gang size, all-or-nothing
+  "cpu_units": 1,               // abstract capacity units (template default)
+  "max_runtime": 60,            // seconds; null = until cancelled
+  "deadline_seconds": 30,       // v2: EDF ordering among equal priority; misses counted
+  "stateful": true,             // v2: overlay-backed data paths (sandbox-api options.stateful)
+  "preemptible": true           // v2: default true for services, false for tasks; needs stateful
 }
 ```
 
 ## Scheduling policy (what "best" means here)
 
-1. **Capacity** - a job admits only if it fits free cpu units AND free
-   sandbox slots AND free app ports (port-needing templates) AND its
-   tenant is under the per-tenant cap. All under one admission lock, so
-   herds cannot oversubscribe.
+1. **Capacity** - cpu units AND sandbox slots AND app ports AND tenant cap
+   AND (v2) memory budget, all under one admission lock.
 2. **Fair queueing** - tenants take turns, least-served first.
-3. **Aging** - +1 effective priority every 5 s queued (cap +6): bounded
-   wait, starvation impossible.
-4. **Skip-and-fill** - a big job that doesn't fit is skipped; smaller jobs
-   behind it still admit.
-5. **Gang admission** - `count: N` is all-or-nothing; partial failure rolls
-   back every created sandbox.
-6. **Janitor** - max-runtime expiry on monotonic deadlines, plus an orphan
-   sweeper that reaps any `sched-*` sandbox with no live job.
+3. **Aging** - +1 effective priority every 5 s queued (cap +6).
+4. **EDF** (v2) - among equal effective priority, earliest deadline first.
+5. **Skip-and-fill** - a big job that does not fit is skipped; smaller ones admit.
+6. **Gang admission** - `count: N` all-or-nothing with rollback.
+7. **Preemption** (v2) - a queued job with effective priority >=
+   `PREEMPT_PRIORITY` (8) that is blocked on CPU evicts the lowest-priority
+   RUNNING services that are `preemptible` AND `stateful` AND single:
+   checkpoint (sandbox-checkpoint) -> delete sandbox -> `PREEMPTED`
+   (queued with +3 resume bonus) -> later admitted by **forking** the
+   checkpoint, so the victim resumes with its data intact.
+8. **Memory budget** (v2) - the monitor samples each running sandbox's
+   cgroup memory through the agent; admission refuses when observed +
+   256 MiB per new cpu unit would exceed the budget (default 75% of the
+   engine's RAM). Refusals are counted.
+9. **Janitor** - max-runtime expiry on monotonic deadlines, orphan sweep.
 
-## Learn it
+## States
 
-- **Guided demo:** `powershell -ExecutionPolicy Bypass -File scripts\demo.ps1`
-- **Edge-case battery:** `bash scripts/verify.sh` (41 assertions)
-- **Practice exercises:** [docs/EXAMPLES.md](docs/EXAMPLES.md)
-- **How it works:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- **Edge cases:** [docs/EDGE-CASES.md](docs/EDGE-CASES.md)
-- **Build notes + bugs found:** [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)
-- **Security posture:** [docs/SECURITY.md](docs/SECURITY.md)
-
-## Reset
-
-```powershell
-scripts\stop.ps1     # keep job DB
-scripts\reset.ps1    # wipe job DB (orphaned sandboxes get reaped on boot)
 ```
+QUEUED -> ADMITTED -> RUNNING -> SUCCEEDED | FAILED | EXPIRED
+RUNNING -> PREEMPTING -> PREEMPTED -> ADMITTED (resume = fork from checkpoint)
+any non-terminal -> CANCELLING -> CANCELLED
+```
+
+## API additions in v2
+
+| Method | Path | New |
+|---|---|---|
+| POST | `/jobs` | `deadline_seconds`, `stateful`, `preemptible` |
+| GET | `/jobs[/{id}]` | `deadline_at`, `deadline_missed`, `checkpoint_id`, `preempt_count`, `mem_bytes` |
+| GET | `/queue` | includes `PREEMPTED` jobs, `deadline_in`, `checkpoint_id` |
+| GET | `/status` | `capacity.memory_budget/memory_observed`, `preemption` counters |
+| GET | `/metrics` | `preemptions_total`, `resumes_total`, `deadline_missed_total`, `memory_refusals_total`, `checkpoint_down` |
+| GET | `/healthz` | `checkpoint` reachability |
+
+## Docs
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - the core/driver split, loops, policy, preemption protocol, memory budget, crash recovery.
+- [`docs/EDGE-CASES.md`](docs/EDGE-CASES.md) - v1 cases re-verified + v2 cases, each mapped to verify.sh or the simulator.
+- [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) - files, the v2 refactor, bugs found (two by the simulator).
+- [`docs/EXAMPLES.md`](docs/EXAMPLES.md) - exercises incl. preemption and deadlines.
+- [`docs/SECURITY.md`](docs/SECURITY.md).

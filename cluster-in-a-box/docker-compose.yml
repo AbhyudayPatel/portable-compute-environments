@@ -1,0 +1,48 @@
+# ============================================================================
+#  cluster-in-a-box - T12-lite: a distributed control plane whose WORKERS
+#  are nested sandbox-api nodes running as sandboxes of the outer platform.
+#
+#    you -> cluster :9430 -> outer sandbox-api (api:8000) creates `worker` sandboxes
+#                         -> worker APIs at dind:9340+k (published by the outer dind)
+#    Windows browser -> localhost:93xx -> outer dind -> worker -> worker's dind -> app
+#
+#  PREREQUISITES: ../sandbox-api up with CLUSTER_PORTS published (default
+#  9300-9349; the dind service must have been (re)created with that range).
+# ============================================================================
+name: cluster-in-a-box
+
+services:
+  cluster:
+    build:
+      context: ./control
+    image: cluster-in-a-box:local
+    environment:
+      SANDBOX_API_URL: ${SANDBOX_API_URL:-http://api:8000}
+      WORKER_HOST: ${WORKER_HOST:-dind}
+      WORKER_API_BASE: ${WORKER_API_BASE:-9340}
+      WORKER_POOL_BASE: ${WORKER_POOL_BASE:-9300}
+      WORKER_POOL_SIZE: ${WORKER_POOL_SIZE:-10}
+      MAX_WORKERS: ${MAX_WORKERS:-4}
+      WORKER_MAX_SANDBOXES: ${WORKER_MAX_SANDBOXES:-6}
+      HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-2}
+      SUSPECT_MISSES: ${SUSPECT_MISSES:-3}
+      DEAD_MISSES: ${DEAD_MISSES:-5}
+      DB_PATH: /data/cluster.db
+    volumes:
+      - cluster-data:/data
+    ports:
+      - "${CLUSTER_PORT:-9430}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [sandnet]
+
+volumes:
+  cluster-data:
+
+networks:
+  sandnet:
+    name: sandbox-api_sandnet
+    external: true

@@ -1,5 +1,15 @@
 # CoreApp — the demo application, line by line
 
+> **Canonical location (2026-10):** the application now lives once at
+> [`coreapp/`](../coreapp/) in the repo root. The copies under
+> `browser-dev-environment/seed/company-app`, `browser-linux-desktop/seed/company-app`,
+> `local-vscode-devcontainer/company-app` and `sandbox-api/api/coreapp` are
+> synchronised from it by `scripts/sync-coreapp.ps1` / `.sh` (`--check`
+> fails on drift). sandbox-api builds its `coreapp` template images from
+> that copy inside dind with content-hashed tags, so an edit here changes
+> the tag and triggers a rebuild.
+
+
 This document explains **the application code itself** — the same code that
 lives in all three projects:
 

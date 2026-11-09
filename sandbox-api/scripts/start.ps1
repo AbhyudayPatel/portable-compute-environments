@@ -24,17 +24,21 @@ if (-not $ok) { throw "API did not become healthy" }
 Write-Host @"
 
 ============================================================
- sandbox-api is UP
-   REST API:      http://localhost:$apiPort
+ sandbox-api v2 is UP
+   Console:       http://localhost:$apiPort        (live events, terminal, files)
    OpenAPI docs:  http://localhost:$apiPort/docs
    Sandbox apps:  http://localhost:9200-9209 (allocated on create)
+   Templates:     web . blank . coreapp . desktop
+   Isolation:     container (runc) . gvisor (runsc)
 
  Try:
    curl -X POST http://localhost:$apiPort/sandboxes \
      -H 'content-type: application/json' \
-     -d '{\"name\":\"demo\",\"template\":\"web\"}'
+     -d '{\"name\":\"demo\",\"template\":\"web\",\"isolation\":\"gvisor\"}'
 
- Verify everything:
+ Verify everything (89 assertions, ~10 min):
    bash scripts/verify.sh
+ Simulate the lifecycle core (no docker needed):
+   cd ..\sandbox-sim; scripts\run.ps1
 ============================================================
 "@

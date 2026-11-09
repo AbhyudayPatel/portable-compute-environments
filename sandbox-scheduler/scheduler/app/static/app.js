@@ -74,6 +74,8 @@ async function refreshQueue() {
       <td style="color:#fbbf24">+${j.aging_bonus}</td>
       <td><b>${j.effective_priority}</b></td>
       <td>${j.age_seconds}</td>
+      <td>${j.deadline_in != null ? j.deadline_in + "s" : "-"}</td>
+      <td><span class="badge ${j.state}">${j.state}${j.checkpoint_id ? " (resume)" : ""}</span></td>
       <td><button class="danger" onclick="cancelJob('${j.id}')">x</button></td>
     </tr>`).join("");
 }
@@ -90,9 +92,12 @@ async function refreshJobs() {
       <td>${j.template}x${j.count}</td>
       <td><span class="badge ${j.state}">${j.state}</span></td>
       <td>${j.wait_seconds ?? "-"}s</td>
+      <td>${[j.stateful ? "stateful" : "", j.preemptible ? "preemptible" : "", j.preempt_count ? "preempted x" + j.preempt_count : "",
+            j.deadline_at ? (j.deadline_missed ? "deadline MISSED" : "deadline") : "", j.mem_bytes ? Math.round(j.mem_bytes/1048576) + " MiB" : ""]
+            .filter(Boolean).join(" . ") || "-"}</td>
       <td>${(j.sandboxes || []).map(sb =>
         `<span class="sandbox-chip">${sb.name || sb.id.slice(0,8)} ${sb.state || ""}</span>`).join("")}</td>
-      <td>${["QUEUED","ADMITTED","RUNNING"].includes(j.state)
+      <td>${["QUEUED","ADMITTED","RUNNING","PREEMPTING","PREEMPTED"].includes(j.state)
         ? `<button class="danger" onclick="event.stopPropagation();cancelJob('${j.id}')">cancel</button>` : ""}</td>
     </tr>`).join("");
 }

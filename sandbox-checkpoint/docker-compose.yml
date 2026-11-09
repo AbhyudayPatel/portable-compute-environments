@@ -1,0 +1,47 @@
+# ============================================================================
+#  T05 - SANDBOX CHECKPOINT: checkpoint / fork / restore / point-in-time
+#
+#  One service. It owns NO docker engine and NO node access: everything is
+#  done through sandbox-api's REST API (pause, volumes snapshot/restore,
+#  node tar/untar restricted to /var/lib/sbx) and the blob store.
+#
+#    you -> checkpoint :9040 -> sandbox-api (api:8000 on sandbox-api's network)
+#                            -> sandbox-blobs (blobs:8000 on sandbox-blobs' network)
+#
+#  PREREQUISITES: ../sandbox-api up; ../sandbox-blobs up (optional, for
+#  shipping layers off the node - set BLOBS_URL empty to disable).
+# ============================================================================
+name: sandbox-checkpoint
+
+services:
+  checkpoint:
+    build:
+      context: ./service
+    image: sandbox-checkpoint:local
+    environment:
+      SANDBOX_API_URL: ${SANDBOX_API_URL:-http://api:8000}
+      BLOBS_URL: ${BLOBS_URL:-http://blobs:8000}
+      DB_PATH: /data/checkpoints.db
+    volumes:
+      - checkpoint-data:/data
+    ports:
+      - "${CHECKPOINT_PORT:-9040}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks:
+      - sandnet
+      - blobnet
+
+volumes:
+  checkpoint-data:
+
+networks:
+  sandnet:
+    name: sandbox-api_sandnet     # join sandbox-api's compose network (api, dind)
+    external: true
+  blobnet:
+    name: sandbox-blobs           # join the blob store's network
+    external: true

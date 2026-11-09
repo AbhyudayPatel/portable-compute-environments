@@ -1,40 +1,49 @@
 # ============================================================================
-#  T01 - SANDBOX API
+#  T01 (v2) - SANDBOX API
 #
 #  Two services:
 #
-#    dind   a dedicated Docker-in-Docker engine. Sandboxes live INSIDE it.
-#           Its daemon API (2375, no TLS) is reachable ONLY on the internal
-#           compose network - it is never published to the Windows host.
+#    dind   a dedicated Docker-in-Docker engine (image: ./dind). Sandboxes
+#           live INSIDE it. Its daemon API (2375, no TLS) and the agent
+#           proxy (7799) are reachable ONLY on the internal compose network.
 #           Its published port range (POOL_START..POOL_END) is the identity
-#           mapping through which sandbox apps become reachable from the
-#           Windows browser: sandbox web port 80 -> dind binds port P ->
-#           Docker Desktop forwards localhost:P.  (Same trick as
-#           docker-nested-lab, but allocated dynamically per sandbox.)
+#           mapping through which sandbox apps reach the Windows browser.
+#           v2: also runs sbx-agent in proxy mode (door to every sandbox
+#           agent) and ships gVisor as an optional runtime.
 #
 #    api    the FastAPI control plane. Talks to dind over tcp://dind:2375
-#           with the official docker SDK. Keeps metadata in SQLite (a
-#           volume). Reconciles DB <-> engine on every boot.
+#           (lifecycle) and http://dind:7799 (everything at runtime: exec
+#           sessions, files, fingerprints, GUI). SQLite metadata in a
+#           volume. Reconciles DB <-> engine on boot and every 30 s; watches
+#           the engine's event stream in between.
 #
-#  Ports are .env-configurable; see .env.example.
+#  Ports and tokens are .env-configurable; see .env.example.
 # ============================================================================
 name: sandbox-api
 
 services:
 
   dind:
-    image: docker:27-dind
+    build:
+      context: ./dind
+      additional_contexts:
+        agent: ./agent
+    image: sandbox-dind:local
     privileged: true                       # required to run dockerd inside
     environment:
       DOCKER_TLS_CERTDIR: ""               # plain 2375 on the internal net
+      SBX_NODE_TOKEN: ${SBX_NODE_TOKEN:-change-me-node-token}
     volumes:
       - dind-data:/var/lib/docker          # inner images/layers persist
+      - sbx-state:/var/lib/sbx             # checkpoints/overlays (ext4, not overlay-on-overlay)
     ports:
       # Identity range: inner published port P == dind port P == localhost:P
       - "${POOL_START:-9200}-${POOL_END:-9209}:${POOL_START:-9200}-${POOL_END:-9209}"
+      # cluster-in-a-box: worker API ports + their identity-port blocks (3-level nesting)
+      - "${CLUSTER_PORTS:-9300-9349}:${CLUSTER_PORTS:-9300-9349}"
     dns: [1.1.1.1, 8.8.8.8]                # dind needs real DNS for pulls
     healthcheck:
-      test: ["CMD-SHELL", "docker info >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "docker info >/dev/null 2>&1 && wget -qO- http://127.0.0.1:7799/healthz >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -44,17 +53,25 @@ services:
   api:
     build:
       context: ./api
-    image: sandbox-api:latest
+      additional_contexts:
+        agent: ./agent
+        egress: ../sandbox-egress/proxy
+        upstream: ../sandbox-egress/upstream
+    image: sandbox-api:local
     depends_on:
       dind:
         condition: service_healthy
     environment:
       DOCKER_HOST: tcp://dind:2375
+      NODE_URL: http://dind:7799
+      SBX_NODE_TOKEN: ${SBX_NODE_TOKEN:-change-me-node-token}
       DB_PATH: /data/sandbox-api.db
       POOL_START: ${POOL_START:-9200}
       POOL_END: ${POOL_END:-9209}
       MAX_SANDBOXES: ${MAX_SANDBOXES:-12}
       REAPER_INTERVAL: ${REAPER_INTERVAL:-5}
+      RESYNC_INTERVAL: ${RESYNC_INTERVAL:-30}
+      DEFAULT_ISOLATION: ${DEFAULT_ISOLATION:-container}
     volumes:
       - api-data:/data
     ports:
@@ -68,6 +85,7 @@ services:
 
 volumes:
   dind-data:    # inner engine: images, layers, containers
+  sbx-state:    # node-side sandbox state: overlay layers, checkpoints
   api-data:     # SQLite metadata store
 
 networks:

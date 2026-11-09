@@ -25,6 +25,11 @@ services:
     image: sandbox-scheduler:latest
     environment:
       SANDBOX_API_URL: ${SANDBOX_API_URL:-http://host.docker.internal:9000}
+      CHECKPOINT_URL: ${CHECKPOINT_URL:-http://host.docker.internal:9040}
+      PREEMPT_PRIORITY: ${PREEMPT_PRIORITY:-8}
+      PREEMPT_RESUME_BONUS: ${PREEMPT_RESUME_BONUS:-3}
+      MEMORY_BUDGET_BYTES: ${MEMORY_BUDGET_BYTES:-}
+      MEM_RESERVE_PER_UNIT: ${MEM_RESERVE_PER_UNIT:-268435456}
       DB_PATH: /data/scheduler.db
       CLUSTER_CPU_UNITS: ${CLUSTER_CPU_UNITS:-4}
       MAX_SCHED_SANDBOXES: ${MAX_SCHED_SANDBOXES:-8}

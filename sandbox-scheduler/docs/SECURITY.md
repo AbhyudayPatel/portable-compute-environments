@@ -46,3 +46,21 @@ what must change before shared use.
 - [ ] Audit log with caller identity (T07 event store).
 - [ ] TLS to upstream; schedulers on multiple machines elect a leader
       (T12) before any of this scales out.
+
+## v2 additions
+
+- **Preemption is a privileged act.** The scheduler can checkpoint and
+  delete any `sched-*` sandbox through sandbox-api and sandbox-checkpoint;
+  it only ever targets jobs flagged `preemptible` and `stateful` by their
+  submitter, and only for a queued job whose effective priority reaches
+  `PREEMPT_PRIORITY`. Priorities are self-declared (like tenants): a
+  client can claim priority 9 and evict others. Real deployments bind
+  priority ceilings to authenticated identities.
+- **Checkpoints of victims** live in the node's checkpoint store and the
+  blob store with the victim's data; they are deleted only by the
+  checkpoint service's own lifecycle, not by the scheduler (a resumed job
+  keeps its checkpoint id for history).
+- **Memory samples** come from each sandbox's cgroup through the agent;
+  they are coarse and can be gamed by a job that allocates late. The
+  budget is a guard against obvious overload, not an isolation boundary
+  (T03 enforces limits).

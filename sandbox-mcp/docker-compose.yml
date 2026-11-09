@@ -1,0 +1,52 @@
+# ============================================================================
+#  sandbox-mcp - the platform as a Model Context Protocol server
+#
+#    MCP client (Claude Code, any agent) --Streamable HTTP--> :9420/mcp
+#          |  Authorization: Bearer <token>   (token -> tenant)
+#          v
+#    tools: create_sandbox, wait_ready, exec, read_file, write_file, list_dir,
+#           fingerprint, diff, events, screenshot, gui_action, set_egress,
+#           checkpoint, fork, restore, list/get/delete_sandbox, list_templates
+#
+#  PREREQUISITES: ../sandbox-api up (and ../sandbox-checkpoint for checkpoint tools).
+# ============================================================================
+name: sandbox-mcp
+
+services:
+  mcp:
+    build:
+      context: ./server
+    image: sandbox-mcp:local
+    environment:
+      SANDBOX_API_URL: ${SANDBOX_API_URL:-http://api:8000}
+      CHECKPOINT_URL: ${CHECKPOINT_URL:-http://checkpoint:8000}
+      MCP_TOKENS: ${MCP_TOKENS:-dev-token:dev,alice-token:alice,bob-token:bob}
+      DB_PATH: /data/mcp.db
+    volumes:
+      - mcp-data:/data
+    ports:
+      - "${MCP_PORT:-9420}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [sandnet]
+
+  # test client image (used by scripts/verify.sh): a real MCP client session
+  client:
+    build:
+      context: ./client
+    image: sandbox-mcp-client:local
+    profiles: [test]
+    environment:
+      MCP_URL: http://mcp:8000/mcp
+    networks: [sandnet]
+
+volumes:
+  mcp-data:
+
+networks:
+  sandnet:
+    name: sandbox-api_sandnet
+    external: true

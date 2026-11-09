@@ -20,6 +20,33 @@
   documented behavior) and **Advanced applications** (the "hard mode"
   features that make it portfolio-grade).
 
+## Status update (2026-10-21): the twelve improvements
+
+The second generation of the platform landed as new standalone projects
+and a rewrite of T01/T02. How they map onto this tasklist:
+
+| Improvement | Project | Tasks it delivers or seeds | Status |
+|---|---|---|---|
+| in-sandbox agent (PID 1, sessions, files, stats, GUI) | `sandbox-api/agent`, `docs/AGENT.md` | T04 terminal + file API (seed), T06 tool RPC (seed), T11 vsock parity (design) | VERIFIED |
+| deterministic simulation | `sandbox-sim/` | T09 chaos (fault model), T12 "cluster simulator mode" (scheduler sim) | VERIFIED (4 + 2 real bugs found) |
+| informer + SSE | `sandbox-api` | T07 event stream (seed), T15 detection latency | VERIFIED |
+| desktop / computer use | `sandbox-api` template `desktop` | T06 GUI agents, T08 GUI tasks (seed) | VERIFIED |
+| egress record/replay + zero-secret | `sandbox-egress/` | T07 replay determinism, T08 offline mode + anti-cheat, T14 fork-PR secrets, T06 exfil containment | VERIFIED |
+| fingerprints + diff | `sandbox-api` | T05 dedup, T07 divergence, T08 tamper/flake detection (seed) | VERIFIED |
+| CoW fork tree + PITR | `sandbox-checkpoint/` | **T05 complete** | VERIFIED (51) |
+| gVisor isolation | `sandbox-api` (`isolation: gvisor`) | T11 EnvRunner with two backends (docker runtimes) | VERIFIED on WSL2 |
+| MCP facade | `sandbox-mcp/` | T06 "any agent", T16 plugin surface | VERIFIED |
+| content-addressed blobs | `sandbox-blobs/` | T05/T07/T08/T14 storage | VERIFIED (44) |
+| cluster-in-a-box | `cluster-in-a-box/` | T12 placement, heartbeats, drain, failover, fencing (migration of stateful sandboxes EXPECTED) | VERIFIED |
+| preemption + EDF + memory budget | `sandbox-scheduler/` v2 | T02 extended; T03 seed (real memory signals) | VERIFIED |
+
+Remaining tasks with no implementation yet: T03 (quotas enforcement lab),
+T04 (gateway: single URL + shareable links; the agent provides the
+terminal/file primitives), T06 (provider loop; MCP replaces the bespoke
+RPC), T07 (hash-chained event store; the informer/SSE and audit tables are
+the inputs), T08, T09 (the simulator's fault model is the scaffold), T10,
+T11 (Firecracker backend), T13, T14, T15, T16.
+
 ## Already built (phases 3-5 groundwork)
 
 | Folder | Phase | Status |

@@ -1,0 +1,105 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --border: #273149;
+  --text: #e6ebf5;
+  --muted: #8b97ad;
+  --accent: #4f8cff;
+  --ok: #35c48d;
+  --bad: #e5534b;
+  --warn: #d9a342;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  justify-content: center;
+  padding: 48px 16px;
+}
+
+.shell { width: 100%; max-width: 640px; }
+
+header h1 { margin: 0; font-size: 32px; letter-spacing: 0.5px; }
+.tagline { margin: 4px 0 24px; color: var(--muted); }
+
+.status-card {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.pill {
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+.pill-ok   { color: var(--ok);   border-color: var(--ok); }
+.pill-bad  { color: var(--bad);  border-color: var(--bad); }
+.pill-warn { color: var(--warn); border-color: var(--warn); }
+
+.task-form { display: flex; gap: 10px; margin-bottom: 20px; }
+
+.task-form input {
+  flex: 1;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 15px;
+}
+.task-form input:focus { outline: 2px solid var(--accent); }
+
+.task-form button {
+  padding: 12px 18px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+  cursor: pointer;
+}
+.task-form button:hover { filter: brightness(1.1); }
+
+.task-list { list-style: none; margin: 0; padding: 0; }
+
+.task {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.task.done .title { text-decoration: line-through; color: var(--muted); }
+.task .title { flex: 1; }
+.task input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
+
+.delete {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+.delete:hover { color: var(--bad); background: rgba(229, 83, 75, 0.12); }
+
+footer { margin-top: 32px; color: var(--muted); font-size: 13px; }
+footer code {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 1px 6px;
+  border-radius: 6px;
+}

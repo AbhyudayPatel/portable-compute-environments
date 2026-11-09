@@ -94,7 +94,7 @@
 <section>
   <h2>Queue <small>queued jobs, sorted by effective priority - watch aging tick</small></h2>
   <table class="jtable"><thead>
-    <tr><th>#</th><th>job</th><th>tenant</th><th>tmpl</th><th>cpu</th><th>prio</th><th>+aged</th><th>=eff</th><th>age s</th><th></th></tr>
+    <tr><th>#</th><th>job</th><th>tenant</th><th>tmpl</th><th>cpu</th><th>prio</th><th>+aged</th><th>=eff</th><th>age s</th><th>deadline</th><th>state</th><th></th></tr>
   </thead><tbody id="queue"></tbody></table>
   <div id="queue-empty" class="empty">queue is empty</div>
 </section>
@@ -102,7 +102,7 @@
 <section>
   <h2>Jobs <small>auto-refreshing every 2s - click a row for details</small></h2>
   <table class="jtable"><thead>
-    <tr><th>job</th><th>tenant</th><th>kind</th><th>tmpl</th><th>state</th><th>wait</th><th>sandboxes</th><th></th></tr>
+    <tr><th>job</th><th>tenant</th><th>kind</th><th>tmpl</th><th>state</th><th>wait</th><th>v2</th><th>sandboxes</th><th></th></tr>
   </thead><tbody id="jobs"></tbody></table>
   <div id="jobs-empty" class="empty">no jobs yet - submit one above</div>
 </section>

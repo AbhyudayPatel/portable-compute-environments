@@ -228,6 +228,67 @@ echo "$M" | grep -q '"p50":' && ok "wait percentiles present" || bad "no percent
 P=$(curl -s "$API/metrics/prometheus")
 echo "$P" | grep -q "scheduler_queue_depth" && ok "prometheus exposition works" || bad "prom: $P"
 
+echo "== 17. v2: EDF - equal priority, earlier deadline first =="
+curl -s -o /dev/null -X POST "$API/admin/reset"; sleep 2
+EB=(); for i in 1 2 3 4; do EB+=($(submit "{\"tenant\":\"edf\",\"template\":\"blank\",\"kind\":\"service\",\"name\":\"edf-b$i\",\"max_runtime\":300}")); done
+for j in "${EB[@]}"; do wait_state "$j" "RUNNING" 60 >/dev/null; done
+LATE=$(submit '{"tenant":"edf","template":"blank","kind":"service","name":"edf-late","priority":5,"deadline_seconds":600,"max_runtime":120}')
+SOON=$(submit '{"tenant":"edf","template":"blank","kind":"service","name":"edf-soon","priority":5,"deadline_seconds":30,"max_runtime":120}')
+sleep 1
+check "queue orders soon before late" "$SOON" "$(curl -s "$API/queue" | python -c "import sys,json; q=[x for x in json.load(sys.stdin) if x['tenant']=='edf']; print(q[0]['id'])")"
+cancel "${EB[0]}"; sleep 6
+check "soon admitted first" "RUNNING" "$(wait_state "$SOON" "RUNNING" 40)"
+check "late still queued" "QUEUED" "$(jstate "$LATE")"
+for j in "${EB[@]}" "$SOON" "$LATE"; do cancel "$j"; done; sleep 5
+
+echo "== 18. v2: deadline miss is counted =="
+M0=$(curl -s "$API/metrics" | jget "['deadline_missed_total']")
+DJ=$(submit '{"tenant":"dl","template":"blank","kind":"task","cmd":["sh","-c","sleep 8"],"deadline_seconds":2}')
+S=$(wait_state "$DJ" "SUCCEEDED,FAILED" 90); check "late task finished" "SUCCEEDED" "$S"
+check "deadline_missed flagged on the job" "true" "$(curl -s "$API/jobs/$DJ" | jget "['deadline_missed']")"
+check "deadline_missed_total incremented" "$((M0+1))" "$(curl -s "$API/metrics" | jget "['deadline_missed_total']")"
+
+echo "== 19. v2: preemption of a stateful service by a high-priority job (needs sandbox-checkpoint) =="
+CK=$(curl -s "$API/healthz" | jget "['checkpoint']")
+if [ "$CK" = "up" ]; then
+  LOW=(); for i in 1 2 3 4; do LOW+=($(submit "{\"tenant\":\"pre\",\"template\":\"blank\",\"kind\":\"service\",\"name\":\"low-$i\",\"priority\":1,\"stateful\":true,\"preemptible\":true,\"max_runtime\":600}")); done
+  # tenant cap is 3: three run, one queues; use a second tenant to fill the 4th unit
+  F4=$(submit '{"tenant":"pre2","template":"blank","kind":"service","name":"low-4b","priority":1,"stateful":true,"preemptible":true,"max_runtime":600}')
+  for j in "${LOW[@]:0:3}" "$F4"; do wait_state "$j" "RUNNING" 90 >/dev/null; done
+  check "cluster full (4 cpu reserved)" "4" "$(curl -s "$API/status" | jget "['capacity']['cpu_reserved']")"
+  HI=$(submit '{"tenant":"vip","template":"blank","kind":"task","cmd":["sh","-c","echo vip; sleep 3"],"priority":9}')
+  S=$(wait_state "$HI" "RUNNING,SUCCEEDED" 120)
+  check "priority-9 job ran despite a full cluster" "true" "$([ "$S" = RUNNING ] || [ "$S" = SUCCEEDED ] && echo true || echo false)"
+  P=$(curl -s "$API/metrics" | jget "['preemptions_total']")
+  [ "${P:-0}" -ge 1 ] && ok "a victim was preempted (preemptions_total=$P)" || bad "no preemption happened"
+  VICTIM=$(curl -s "$API/jobs" | python -c "import sys,json; v=[j for j in json.load(sys.stdin) if j['preempt_count']>0]; print(v[0]['id'] if v else '')")
+  check "victim has a checkpoint id" "true" "$(curl -s "$API/jobs/$VICTIM" | python -c "import sys,json; print(str(bool(json.load(sys.stdin)['checkpoint_id'])).lower())")"
+  wait_state "$HI" "SUCCEEDED,FAILED" 90 >/dev/null
+  S=$(wait_state "$VICTIM" "RUNNING" 150)
+  check "victim resumed after the vip job finished" "RUNNING" "$S"
+  curl -s "$API/jobs/$VICTIM/events" | python -c "import sys,json; sys.exit(0 if any('forked from checkpoint' in e['message'] for e in json.load(sys.stdin)) else 1)" && ok "resume used a checkpoint fork" || bad "no fork event"
+  check "resumes_total >= 1" "true" "$(curl -s "$API/metrics" | python -c "import sys,json; print(str(json.load(sys.stdin)['resumes_total']>=1).lower())")"
+  for j in "${LOW[@]}" "$F4"; do cancel "$j"; done; sleep 8
+  LEAK=$(engine_sbx_count); check "no sandboxes leaked after preemption cycle" "0" "$LEAK"
+else
+  echo "  SKIP  checkpoint service not reachable; preemption test skipped (EXPECTED)"
+fi
+
+echo "== 20. v2: memory budget refuses admission =="
+# a budget smaller than one job's estimate -> everything waits with a memory refusal counted
+MB0=$(curl -s "$API/metrics" | jget "['memory_refusals_total']")
+docker compose stop scheduler >/dev/null 2>&1
+MEMORY_BUDGET_BYTES=1 docker compose up -d scheduler >/dev/null 2>&1
+for i in $(seq 1 30); do curl -s "$API/healthz" 2>/dev/null | grep -q '"scheduler":"up"' && break; sleep 2; done
+MJ=$(submit '{"tenant":"mem","template":"blank","kind":"task","cmd":["true"]}')
+sleep 6
+check "job waits in QUEUED under a 1-byte budget" "QUEUED" "$(jstate "$MJ")"
+check "memory_refusals_total grew" "true" "$(curl -s "$API/metrics" | python -c "import sys,json; print(str(json.load(sys.stdin)['memory_refusals_total']>${MB0:-0}).lower())")"
+docker compose stop scheduler >/dev/null 2>&1
+docker compose up -d scheduler >/dev/null 2>&1
+for i in $(seq 1 30); do curl -s "$API/healthz" 2>/dev/null | grep -q '"scheduler":"up"' && break; sleep 2; done
+check "job runs once the budget is back" "SUCCEEDED" "$(wait_state "$MJ" "SUCCEEDED,FAILED" 90)"
+
 echo
 echo "======================================================"
 echo "  RESULT:  $PASS passed, $FAIL failed"
